@@ -294,19 +294,18 @@ ENABLE_CARETAKER_POLL = os.getenv("ENABLE_CARETAKER_POLL", "0").strip().lower() 
 SOS_API_URL = os.getenv("SOS_API_URL", "").strip()
 SOS_API_TOKEN = os.getenv("SOS_API_TOKEN", "").strip()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDeer2H_t1KwQW9vbBZX1ufBDVqeGgGmKo").strip() #api key not found 
 GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash").strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-pro").strip()
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").strip()
 
-GEMMA_LOCAL_URL = os.getenv("GEMMA_LOCAL_URL", "http://localhost:11434/api/chat").strip()
+GEMMA_LOCAL_URL = os.getenv("GEMMA_LOCAL_URL", "http://localhost:11434/api/chat").strip() # error
 GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma3").strip()
 
 LED_HEARTBEAT_STATE = False
 LED_PROCESSING_STATE = False
 LED_ALERT_STATE = False
 LED_OBSTACLE_MODE_STATE = False
-
 _GEMINI_BACKOFF_UNTIL = 0.0
 _LAST_GEMINI_BACKOFF_LOG_AT = 0.0
 _GEMMA_BACKOFF_UNTIL = 0.0
