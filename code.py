@@ -3,8 +3,9 @@
 
 Features:
 - Button 1 short press: SOS alert.
-- Button 1 medium press: human presence detection using local Gemma.
-- Button 1 long press: room scan using Gemini vision.
+- Button 1 medium press: room summary converted to Morse.
+- Button 1 double press: person-priority room scan with vibration + blinking red alert.
+- Button 1 long press: human presence detection using local Gemma.
 - Button 2 short press: fetch a server message and convert it to Morse.
 - Button 2 long press: toggle ultrasonic obstacle awareness mode LED.
 - Ultrasonic obstacle awareness and LED status indicators.
@@ -253,6 +254,7 @@ BUTTON_POLL_SECONDS = float(os.getenv("BUTTON_POLL_SECONDS", "0.01"))
 SHORT_PRESS_SECONDS = float(os.getenv("SHORT_PRESS_SECONDS", "0.60"))
 LONG_PRESS_SECONDS = float(os.getenv("LONG_PRESS_SECONDS", "1.80"))
 MEDIUM_PRESS_SECONDS = float(os.getenv("MEDIUM_PRESS_SECONDS", "1.10"))
+DOUBLE_PRESS_WINDOW_SECONDS = float(os.getenv("DOUBLE_PRESS_WINDOW_SECONDS", "0.60"))
 
 DISTANCE_POLL_SECONDS = float(os.getenv("DISTANCE_POLL_SECONDS", "0.20"))
 OBSTACLE_THRESHOLD_CM = float(os.getenv("OBSTACLE_THRESHOLD_CM", "100"))
@@ -306,6 +308,11 @@ LED_HEARTBEAT_STATE = False
 LED_PROCESSING_STATE = False
 LED_ALERT_STATE = False
 LED_OBSTACLE_MODE_STATE = False
+
+PERSON_ALERT_BLINK_INTERVAL_SECONDS = float(os.getenv("PERSON_ALERT_BLINK_INTERVAL_SECONDS", "0.40"))
+PERSON_ALERT_ACTIVE = False
+PERSON_ALERT_LED_ON = False
+PERSON_ALERT_LAST_TOGGLE_AT = 0.0
 _GEMINI_BACKOFF_UNTIL = 0.0
 _LAST_GEMINI_BACKOFF_LOG_AT = 0.0
 _GEMMA_BACKOFF_UNTIL = 0.0
@@ -779,6 +786,25 @@ def set_obstacle_mode_led(enabled: bool) -> None:
         log(f"Obstacle mode LED control failed: {exc}")
 
 
+def set_person_alert_mode(active: bool) -> None:
+    global PERSON_ALERT_ACTIVE, PERSON_ALERT_LED_ON, PERSON_ALERT_LAST_TOGGLE_AT
+    PERSON_ALERT_ACTIVE = active
+    PERSON_ALERT_LED_ON = False
+    PERSON_ALERT_LAST_TOGGLE_AT = 0.0
+    if not active:
+        control_leds(alert=False)
+
+
+def update_person_alert_led(now: float) -> bool:
+    global PERSON_ALERT_LED_ON, PERSON_ALERT_LAST_TOGGLE_AT
+    if not PERSON_ALERT_ACTIVE:
+        return False
+    if PERSON_ALERT_LAST_TOGGLE_AT == 0.0 or (now - PERSON_ALERT_LAST_TOGGLE_AT) >= PERSON_ALERT_BLINK_INTERVAL_SECONDS:
+        PERSON_ALERT_LED_ON = not PERSON_ALERT_LED_ON
+        PERSON_ALERT_LAST_TOGGLE_AT = now
+    return PERSON_ALERT_LED_ON
+
+
 def navigation_band_from_distance(distance_cm: float) -> str:
     """Maps measured distance to navigation feedback bands."""
     if distance_cm > 150:
@@ -917,6 +943,44 @@ def sanitize_room_output(response_text: str) -> str:
     return result[:MAX_MORSE_CHARS] or "ERR"
 
 
+def description_mentions_person(text: str) -> bool:
+    upper_text = normalize_text(text).upper()
+    return any(token in upper_text for token in ("PERSON", "HUMAN", "MAN", "WOMAN", "PEOPLE", "CHILD"))
+
+
+def build_room_description(image_path: Path, *, prioritize_person: bool = False) -> str:
+    if prioritize_person:
+        prompt = (
+            "Look carefully for people first. Reply in this format only: "
+            "PERSON:YES|NO; DESC:<3 to 6 words about room>."
+        )
+    else:
+        prompt = "Describe what is in this room in 3 to 6 short words."
+
+    response_text = call_gemini_api(image_path, prompt, model=GEMINI_VISION_MODEL)
+    if not response_text:
+        return "UNKNOWN AREA"
+    return response_text
+
+
+def parse_person_priority_response(text: str) -> tuple[Optional[bool], str]:
+    normalized = normalize_text(text)
+    upper_text = normalized.upper()
+    person_present: Optional[bool] = None
+
+    if "PERSON:YES" in upper_text:
+        person_present = True
+    elif "PERSON:NO" in upper_text:
+        person_present = False
+
+    description_text = normalized
+    match = re.search(r"DESC\s*:\s*(.+)", normalized, flags=re.IGNORECASE)
+    if match:
+        description_text = match.group(1).strip()
+
+    return person_present, sanitize_room_output(description_text)
+
+
 def post_sos_alert() -> bool:
     if not SOS_API_URL:
         log("SOS_API_URL is not configured; alert will be logged only.")
@@ -986,6 +1050,12 @@ class ButtonState:
     stable_state: bool = False
     last_change_at: float = 0.0
     press_started_at: Optional[float] = None
+
+
+@dataclass
+class DoublePressState:
+    waiting_second_press: bool = False
+    first_press_at: float = 0.0
 
 
 class MorseWorker:
@@ -1093,6 +1163,7 @@ def play_haptic(morse_worker: MorseWorker, pattern: str, prefix_key: Optional[st
 
 def handle_sos(morse_worker: MorseWorker) -> None:
     log("Button 1 short press: SOS")
+    set_person_alert_mode(False)
     control_leds(processing=True)
     try:
         post_sos_alert()
@@ -1102,7 +1173,8 @@ def handle_sos(morse_worker: MorseWorker) -> None:
 
 
 def handle_detection(morse_worker: MorseWorker) -> None:
-    log("Button 1 medium press: human presence check")
+    log("Button 1 long press: human presence check")
+    set_person_alert_mode(False)
     control_leds(processing=True)
     image_path = capture_image("detection")
     if image_path is None:
@@ -1115,16 +1187,15 @@ def handle_detection(morse_worker: MorseWorker) -> None:
         if not detection_result:
             detection_result = "NO"
 
-        morse_pattern = call_gemini_morse(detection_result)
-        if not morse_pattern:
-            morse_pattern = text_to_morse_local(detection_result)
+        morse_pattern = text_to_morse_local(detection_result)
         play_haptic(morse_worker, morse_pattern, prefix_key="detection")
     finally:
         control_leds(processing=False)
 
 
 def handle_room_scan(morse_worker: MorseWorker) -> None:
-    log("Button 1 long press: room scan")
+    log("Button 1 medium press: room description")
+    set_person_alert_mode(False)
     control_leds(processing=True)
     image_path = capture_image("roomscan")
     if image_path is None:
@@ -1133,15 +1204,43 @@ def handle_room_scan(morse_worker: MorseWorker) -> None:
         return
 
     try:
-        prompt = "Describe the surroundings in 3 to 5 short words for navigation."
-        response_text = call_gemini_api(image_path, prompt, model=GEMINI_VISION_MODEL)
-        if not response_text:
-            response_text = "UNKNOWN AREA"
-
+        response_text = build_room_description(image_path, prioritize_person=False)
         room_summary = sanitize_room_output(response_text)
-        morse_pattern = call_gemini_morse(room_summary)
-        if not morse_pattern:
-            morse_pattern = text_to_morse_local(room_summary)
+        morse_pattern = text_to_morse_local(room_summary)
+        play_haptic(morse_worker, morse_pattern, prefix_key="room_scan")
+    finally:
+        control_leds(processing=False)
+
+
+def handle_person_priority_room_scan(morse_worker: MorseWorker) -> None:
+    log("Button 1 double press: person-priority room scan")
+    control_leds(processing=True)
+    image_path = capture_image("room_priority")
+    if image_path is None:
+        play_haptic(morse_worker, "...", prefix_key="room_scan")
+        control_leds(processing=False)
+        return
+
+    try:
+        response_text = build_room_description(image_path, prioritize_person=True)
+        person_from_vision, room_summary = parse_person_priority_response(response_text)
+        person_from_local = detect_human_gemma(image_path)
+
+        person_present = person_from_local == "YES"
+        if person_from_local is None and person_from_vision is not None:
+            person_present = person_from_vision
+        if person_from_local is None and person_from_vision is None:
+            person_present = description_mentions_person(room_summary)
+
+        if person_present:
+            set_person_alert_mode(True)
+            play_haptic(morse_worker, "--- ---", prefix_key=None)
+            message_text = f"PERSON {room_summary}"
+        else:
+            set_person_alert_mode(False)
+            message_text = room_summary
+
+        morse_pattern = text_to_morse_local(message_text)
         play_haptic(morse_worker, morse_pattern, prefix_key="room_scan")
     finally:
         control_leds(processing=False)
@@ -1242,7 +1341,8 @@ def handle_obstacle_awareness_toggle(morse_worker: MorseWorker, currently_enable
     if next_enabled:
         play_haptic(morse_worker, ".-", prefix_key=None)
     else:
-        control_leds(alert=False)
+        if not PERSON_ALERT_ACTIVE:
+            control_leds(alert=False)
         play_haptic(morse_worker, "-...", prefix_key=None)
     return next_enabled
 
@@ -1279,6 +1379,7 @@ def main() -> None:
 
     button1_state = ButtonState()
     button2_state = ButtonState()
+    button1_double_press_state = DoublePressState()
 
     set_obstacle_mode_led(obstacle_awareness_enabled)
     log(f"Ultrasonic obstacle awareness: {'enabled' if obstacle_awareness_enabled else 'disabled'}")
@@ -1290,9 +1391,37 @@ def main() -> None:
             obstacle_active = False
             last_nav_band = None
 
+    def _button1_short_press() -> None:
+        now_local = time.monotonic()
+        if (
+            button1_double_press_state.waiting_second_press
+            and (now_local - button1_double_press_state.first_press_at) <= DOUBLE_PRESS_WINDOW_SECONDS
+        ):
+            button1_double_press_state.waiting_second_press = False
+            handle_person_priority_room_scan(morse_worker)
+            return
+
+        button1_double_press_state.waiting_second_press = True
+        button1_double_press_state.first_press_at = now_local
+
+    def _button1_medium_press() -> None:
+        button1_double_press_state.waiting_second_press = False
+        handle_room_scan(morse_worker)
+
+    def _button1_long_press() -> None:
+        button1_double_press_state.waiting_second_press = False
+        handle_detection(morse_worker)
+
     try:
         while not stop_event.is_set():
             now = time.monotonic()
+
+            if (
+                button1_double_press_state.waiting_second_press
+                and (now - button1_double_press_state.first_press_at) > DOUBLE_PRESS_WINDOW_SECONDS
+            ):
+                button1_double_press_state.waiting_second_press = False
+                handle_sos(morse_worker)
 
             if (now - last_heartbeat_toggle) >= 1.0:
                 heartbeat_on = not heartbeat_on
@@ -1308,13 +1437,11 @@ def main() -> None:
                 distance_cm = measure_distance()
                 if distance_cm is not None and distance_cm < OBSTACLE_THRESHOLD_CM:
                     obstacle_active = True
-                    control_leds(alert=True)
                     if (now - last_obstacle_alert_at) >= OBSTACLE_ALERT_COOLDOWN_SECONDS:
                         send_obstacle_warning(morse_worker)
                         last_obstacle_alert_at = now
                 else:
                     obstacle_active = False
-                    control_leds(alert=False)
 
                 # Distance-based Morse guidance for navigation.
                 if ENABLE_NAV_MORSE_GUIDANCE and distance_cm is not None:
@@ -1327,7 +1454,6 @@ def main() -> None:
                 last_distance_poll = now
             elif not obstacle_awareness_enabled and obstacle_active:
                 obstacle_active = False
-                control_leds(alert=False)
 
             handle_button_input(
                 now,
@@ -1336,9 +1462,9 @@ def main() -> None:
                 SHORT_PRESS_SECONDS,
                 MEDIUM_PRESS_SECONDS,
                 LONG_PRESS_SECONDS,
-                short_action=lambda: handle_sos(morse_worker),
-                medium_action=lambda: handle_detection(morse_worker),
-                long_action=lambda: handle_room_scan(morse_worker),
+                short_action=_button1_short_press,
+                medium_action=_button1_medium_press,
+                long_action=_button1_long_press,
             )
 
             handle_button_input(
@@ -1352,8 +1478,9 @@ def main() -> None:
                 long_action=_toggle_obstacle_awareness,
             )
 
-            if not obstacle_active and not LED_ALERT_STATE:
-                control_leds(alert=False)
+            person_alert_led = update_person_alert_led(now)
+            should_light_alert = obstacle_active or person_alert_led
+            control_leds(alert=should_light_alert)
 
             time.sleep(BUTTON_POLL_SECONDS)
     finally:
