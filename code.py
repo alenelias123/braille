@@ -255,6 +255,9 @@ MEDIUM_PRESS_SECONDS = float(os.getenv("MEDIUM_PRESS_SECONDS", "1.10"))
 DISTANCE_POLL_SECONDS = float(os.getenv("DISTANCE_POLL_SECONDS", "0.20"))
 OBSTACLE_THRESHOLD_CM = float(os.getenv("OBSTACLE_THRESHOLD_CM", "100"))
 OBSTACLE_ALERT_COOLDOWN_SECONDS = float(os.getenv("OBSTACLE_ALERT_COOLDOWN_SECONDS", "2.50"))
+ENABLE_NAV_MORSE_GUIDANCE = os.getenv("ENABLE_NAV_MORSE_GUIDANCE", "1").strip().lower() in {"1", "true", "yes", "on"}
+NAV_GUIDANCE_MIN_INTERVAL_SECONDS = float(os.getenv("NAV_GUIDANCE_MIN_INTERVAL_SECONDS", "3.0"))
+NAV_GUIDANCE_LED_PIN = int(os.getenv("NAV_GUIDANCE_LED_PIN", str(LED3_PIN)))
 
 MORSE_DOT_SECONDS = float(os.getenv("MORSE_DOT_SECONDS", "0.20"))
 MORSE_DASH_SECONDS = float(os.getenv("MORSE_DASH_SECONDS", "0.60"))
@@ -641,6 +644,26 @@ def control_leds(*, heartbeat: Optional[bool] = None, processing: Optional[bool]
         log(f"LED control failed: {exc}")
 
 
+def navigation_band_from_distance(distance_cm: float) -> str:
+    """Maps measured distance to navigation feedback bands."""
+    if distance_cm > 150:
+        return "CLEAR"
+    if 80 <= distance_cm <= 150:
+        return "FAR"
+    if 30 <= distance_cm < 80:
+        return "NEAR"
+    return "STOP"
+
+
+def send_navigation_guidance(morse_worker: "MorseWorker", distance_cm: float) -> None:
+    """Converts distance band to Morse and pushes it to haptic+LED output."""
+    band = navigation_band_from_distance(distance_cm)
+    morse_pattern = text_to_morse_local(band)
+    if morse_pattern:
+        log(f"Navigation guidance: {band} ({distance_cm:.1f} cm)")
+        play_haptic(morse_worker, morse_pattern)
+
+
 def encode_image_base64(image_path: Path) -> str:
     with image_path.open("rb") as image_file:
         encoded_bytes = base64.b64encode(image_file.read())
@@ -651,19 +674,31 @@ def capture_image(prefix: str) -> Optional[Path]:
     IMAGE_DIRECTORY.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_path = IMAGE_DIRECTORY / f"{prefix}_{timestamp}.jpg"
+    errors: List[str] = []
 
-    try:
-        if Picamera2 is not None:
+    if Picamera2 is not None:
+        camera = None
+        try:
             camera = Picamera2()
             try:
+                config = camera.create_still_configuration(
+                    main={"size": (1280, 720), "format": "RGB888"}
+                )
+            except Exception:
+                # Some USB/UVC cameras expose limited formats; use backend default.
                 config = camera.create_still_configuration()
-                camera.configure(config)
-                camera.start()
-                time.sleep(1.0)
-                camera.capture_file(str(image_path))
+            camera.configure(config)
+            camera.start()
+            time.sleep(0.8)
+            camera.capture_file(str(image_path))
+            if image_path.exists() and image_path.stat().st_size > 0:
                 log(f"Captured image with Picamera2: {image_path}")
                 return image_path
-            finally:
+            errors.append("Picamera2 created an empty image")
+        except Exception as exc:
+            errors.append(f"Picamera2 failed: {exc}")
+        finally:
+            if camera is not None:
                 try:
                     camera.stop()
                 except Exception:
@@ -673,24 +708,42 @@ def capture_image(prefix: str) -> Optional[Path]:
                 except Exception:
                     pass
 
-        if shutil.which("libcamera-still"):
-            command = [
-                "libcamera-still",
-                "-n",
-                "-t",
-                "1000",
-                "-o",
-                str(image_path),
-            ]
-            subprocess.run(command, check=True, timeout=25, capture_output=True)
-            log(f"Captured image with libcamera-still: {image_path}")
-            return image_path
+    for tool_name in ("rpicam-still", "libcamera-still"):
+        if not shutil.which(tool_name):
+            continue
+        command = [
+            tool_name,
+            "-n",
+            "-t",
+            "1000",
+            "-o",
+            str(image_path),
+        ]
+        try:
+            subprocess.run(command, check=True, timeout=30, capture_output=True, text=True)
+            if image_path.exists() and image_path.stat().st_size > 0:
+                log(f"Captured image with {tool_name}: {image_path}")
+                return image_path
+            errors.append(f"{tool_name} created an empty image")
+        except Exception as exc:
+            errors.append(f"{tool_name} failed: {exc}")
 
-        log("No camera backend available.")
-        return None
-    except Exception as exc:
-        log(f"Image capture failed: {exc}")
-        return None
+    if shutil.which("fswebcam"):
+        command = ["fswebcam", "-r", "640x480", "--no-banner", str(image_path)]
+        try:
+            subprocess.run(command, check=True, timeout=30, capture_output=True, text=True)
+            if image_path.exists() and image_path.stat().st_size > 0:
+                log(f"Captured image with fswebcam: {image_path}")
+                return image_path
+            errors.append("fswebcam created an empty image")
+        except Exception as exc:
+            errors.append(f"fswebcam failed: {exc}")
+
+    if errors:
+        log("Image capture failed: " + " | ".join(errors))
+    else:
+        log("Image capture failed: no camera backend available")
+    return None
 
 
 def sanitize_detection_output(response_text: str) -> str:
@@ -853,8 +906,10 @@ class MorseWorker:
 
     def _pulse(self, duration: float) -> None:
         GPIO.output(VIBRATION_PIN, GPIO.HIGH)
+        GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.HIGH)
         time.sleep(duration)
         GPIO.output(VIBRATION_PIN, GPIO.LOW)
+        GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.LOW)
 
     def _pause(self, duration: float) -> None:
         time.sleep(duration)
@@ -869,6 +924,7 @@ def setup_gpio() -> None:
     GPIO.setup(LED1_PIN, GPIO.OUT)
     GPIO.setup(LED2_PIN, GPIO.OUT)
     GPIO.setup(LED3_PIN, GPIO.OUT)
+    GPIO.setup(NAV_GUIDANCE_LED_PIN, GPIO.OUT)
     GPIO.setup(TRIG_PIN, GPIO.OUT)
     GPIO.setup(ECHO_PIN, GPIO.IN)
     GPIO.output(TRIG_PIN, GPIO.LOW)
@@ -878,6 +934,7 @@ def setup_gpio() -> None:
 def cleanup_gpio() -> None:
     try:
         GPIO.output(VIBRATION_PIN, GPIO.LOW)
+        GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.LOW)
         GPIO.output(LED1_PIN, GPIO.LOW)
         GPIO.output(LED2_PIN, GPIO.LOW)
         GPIO.output(LED3_PIN, GPIO.LOW)
@@ -1062,6 +1119,8 @@ def main() -> None:
     heartbeat_on = False
     obstacle_active = False
     last_obstacle_alert_at = 0.0
+    last_nav_guidance_at = 0.0
+    last_nav_band: Optional[str] = None
 
     button1_state = ButtonState()
     button2_state = ButtonState()
@@ -1091,6 +1150,15 @@ def main() -> None:
                 else:
                     obstacle_active = False
                     control_leds(alert=False)
+
+                # Distance-based Morse guidance for navigation.
+                if ENABLE_NAV_MORSE_GUIDANCE and distance_cm is not None:
+                    nav_band = navigation_band_from_distance(distance_cm)
+                    should_announce = nav_band != last_nav_band and (now - last_nav_guidance_at) >= NAV_GUIDANCE_MIN_INTERVAL_SECONDS
+                    if should_announce:
+                        send_navigation_guidance(morse_worker, distance_cm)
+                        last_nav_band = nav_band
+                        last_nav_guidance_at = now
                 last_distance_poll = now
 
             handle_button_input(
