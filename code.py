@@ -5,11 +5,12 @@ Features:
 - Button 1 short press: SOS alert.
 - Button 1 medium press: human presence detection using local Gemma.
 - Button 1 long press: room scan using Gemini vision.
-- Button 2 press: fetch a server message and convert it to Morse with Gemini Flash.
+- Button 2 short press: fetch a server message and convert it to Morse.
+- Button 2 long press: toggle ultrasonic obstacle awareness mode LED.
 - Ultrasonic obstacle awareness and LED status indicators.
 
 The script is designed to keep working even when some hardware or APIs are
-unavailable. It logs failures, retries network calls once, and keeps the main
+unavailable. It logs failures, uses configurable retries/backoff, and keeps the main
 loop responsive by sending Morse output through a background worker.
 """
 
@@ -32,6 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
@@ -255,6 +257,8 @@ MEDIUM_PRESS_SECONDS = float(os.getenv("MEDIUM_PRESS_SECONDS", "1.10"))
 DISTANCE_POLL_SECONDS = float(os.getenv("DISTANCE_POLL_SECONDS", "0.20"))
 OBSTACLE_THRESHOLD_CM = float(os.getenv("OBSTACLE_THRESHOLD_CM", "100"))
 OBSTACLE_ALERT_COOLDOWN_SECONDS = float(os.getenv("OBSTACLE_ALERT_COOLDOWN_SECONDS", "2.50"))
+ENABLE_OBSTACLE_AWARENESS = os.getenv("ENABLE_OBSTACLE_AWARENESS", "1").strip().lower() in {"1", "true", "yes", "on"}
+OBSTACLE_MODE_LED_PIN = int(os.getenv("OBSTACLE_MODE_LED_PIN", "25"))  # Obstacle mode LED, physical pin 22
 ENABLE_NAV_MORSE_GUIDANCE = os.getenv("ENABLE_NAV_MORSE_GUIDANCE", "1").strip().lower() in {"1", "true", "yes", "on"}
 NAV_GUIDANCE_MIN_INTERVAL_SECONDS = float(os.getenv("NAV_GUIDANCE_MIN_INTERVAL_SECONDS", "3.0"))
 NAV_GUIDANCE_LED_PIN = int(os.getenv("NAV_GUIDANCE_LED_PIN", str(LED3_PIN)))
@@ -268,17 +272,29 @@ MORSE_WORD_GAP = float(os.getenv("MORSE_WORD_GAP", "0.90"))
 MAX_MORSE_CHARS = int(os.getenv("MAX_MORSE_CHARS", "18"))
 CARETAKER_POLL_SECONDS = float(os.getenv("CARETAKER_POLL_SECONDS", "10"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "10"))
-REQUEST_RETRIES = 1
+REQUEST_RETRIES = max(0, int(os.getenv("REQUEST_RETRIES", "1")))
+REQUEST_RETRY_BASE_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_BASE_DELAY_SECONDS", "0.35"))
+REQUEST_RETRY_MAX_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_MAX_DELAY_SECONDS", "3.0"))
+
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "6"))
+GEMINI_RETRIES = max(0, int(os.getenv("GEMINI_RETRIES", "0")))
+GEMINI_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
+GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
+
+GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "4"))
+GEMMA_RETRIES = max(0, int(os.getenv("GEMMA_RETRIES", "0")))
+GEMMA_FAILURE_COOLDOWN_SECONDS = float(os.getenv("GEMMA_FAILURE_COOLDOWN_SECONDS", "20"))
+GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
 
 IMAGE_DIRECTORY = Path(os.getenv("IMAGE_DIRECTORY", str(Path(tempfile.gettempdir()) / "assistive_images")))
 
-CARETAKER_API_URL = os.getenv("CAREGIVER_API_URL", "").strip()
-CARETAKER_API_TOKEN = os.getenv("CAREGIVER_API_TOKEN", "").strip()
+CARETAKER_API_URL = os.getenv("CARETAKER_API_URL", os.getenv("CAREGIVER_API_URL", "")).strip()
+CARETAKER_API_TOKEN = os.getenv("CARETAKER_API_TOKEN", os.getenv("CAREGIVER_API_TOKEN", "")).strip()
 ENABLE_CARETAKER_POLL = os.getenv("ENABLE_CARETAKER_POLL", "0").strip().lower() in {"1", "true", "yes", "on"}
 SOS_API_URL = os.getenv("SOS_API_URL", "").strip()
 SOS_API_TOKEN = os.getenv("SOS_API_TOKEN", "").strip()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDeer2H_t1KwQW9vbBZX1ufBDVqeGgGmKo").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash").strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-pro").strip()
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").strip()
@@ -289,6 +305,12 @@ GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma3").strip()
 LED_HEARTBEAT_STATE = False
 LED_PROCESSING_STATE = False
 LED_ALERT_STATE = False
+LED_OBSTACLE_MODE_STATE = False
+
+_GEMINI_BACKOFF_UNTIL = 0.0
+_LAST_GEMINI_BACKOFF_LOG_AT = 0.0
+_GEMMA_BACKOFF_UNTIL = 0.0
+_LAST_GEMMA_BACKOFF_LOG_AT = 0.0
 
 
 MORSE_CODE: Dict[str, str] = {
@@ -415,6 +437,35 @@ def extract_text_from_payload(payload: Any) -> str:
     return str(payload).strip()
 
 
+def parse_retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        retry_seconds = float(value.strip())
+    except Exception:
+        return None
+    return max(0.0, retry_seconds)
+
+
+def should_retry_request_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib_error.HTTPError):
+        return exc.code in {408, 425, 429, 500, 502, 503, 504}
+    if isinstance(exc, urllib_error.URLError):
+        return True
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def retry_delay_seconds(exc: Exception, attempt: int) -> float:
+    if isinstance(exc, urllib_error.HTTPError):
+        retry_after = parse_retry_after_seconds(exc.headers.get("Retry-After"))
+        if retry_after is not None:
+            return min(REQUEST_RETRY_MAX_DELAY_SECONDS, retry_after)
+    exponential = REQUEST_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt - 1))
+    return min(REQUEST_RETRY_MAX_DELAY_SECONDS, exponential)
+
+
 def request_json(
     method: str,
     url: str,
@@ -435,7 +486,7 @@ def request_json(
         body = json.dumps(payload).encode("utf-8")
 
     last_error: Optional[Exception] = None
-    attempt_count = retries + 1
+    attempt_count = max(1, retries + 1)
     for attempt in range(1, attempt_count + 1):
         try:
             request = urllib_request.Request(url, data=body, headers=request_headers, method=method.upper())
@@ -447,12 +498,50 @@ def request_json(
         except Exception as exc:
             last_error = exc
             log(f"Request attempt {attempt}/{attempt_count} failed for {url}: {exc}")
-            if attempt < attempt_count:
-                time.sleep(0.25)
+            if attempt < attempt_count and should_retry_request_error(exc):
+                time.sleep(retry_delay_seconds(exc, attempt))
+                continue
+            break
 
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"Request failed for {url}")
+
+
+def activate_gemini_rate_limit(retry_after_seconds: Optional[float] = None) -> None:
+    global _GEMINI_BACKOFF_UNTIL
+    cooldown = retry_after_seconds if retry_after_seconds is not None else GEMINI_RATE_LIMIT_COOLDOWN_SECONDS
+    cooldown = max(1.0, cooldown)
+    _GEMINI_BACKOFF_UNTIL = max(_GEMINI_BACKOFF_UNTIL, time.monotonic() + cooldown)
+
+
+def gemini_available() -> bool:
+    global _LAST_GEMINI_BACKOFF_LOG_AT
+    now = time.monotonic()
+    remaining = _GEMINI_BACKOFF_UNTIL - now
+    if remaining <= 0:
+        return True
+    if now - _LAST_GEMINI_BACKOFF_LOG_AT >= GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS:
+        log(f"Gemini cooldown active for {remaining:.0f}s; using local fallback.")
+        _LAST_GEMINI_BACKOFF_LOG_AT = now
+    return False
+
+
+def mark_gemma_temporarily_unavailable() -> None:
+    global _GEMMA_BACKOFF_UNTIL
+    _GEMMA_BACKOFF_UNTIL = max(_GEMMA_BACKOFF_UNTIL, time.monotonic() + GEMMA_FAILURE_COOLDOWN_SECONDS)
+
+
+def gemma_available() -> bool:
+    global _LAST_GEMMA_BACKOFF_LOG_AT
+    now = time.monotonic()
+    remaining = _GEMMA_BACKOFF_UNTIL - now
+    if remaining <= 0:
+        return True
+    if now - _LAST_GEMMA_BACKOFF_LOG_AT >= GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS:
+        log(f"Gemma local inference on cooldown for {remaining:.0f}s after recent failures.")
+        _LAST_GEMMA_BACKOFF_LOG_AT = now
+    return False
 
 
 def clamp_text_for_prompt(text: str, max_chars: int = 20) -> str:
@@ -490,6 +579,8 @@ def call_gemini_morse(text: str) -> Optional[str]:
     if not GEMINI_API_KEY:
         log("GEMINI_API_KEY is not configured for Morse conversion.")
         return sanitize_morse_output(text_to_morse_local(text)) or None
+    if not gemini_available():
+        return sanitize_morse_output(text_to_morse_local(text)) or None
 
     cleaned_text = clamp_text_for_prompt(text, max_chars=20)
     prompt = f"Convert the following text into Morse code using dots and dashes only. Keep it short: {cleaned_text}"
@@ -511,7 +602,13 @@ def call_gemini_morse(text: str) -> Optional[str]:
     }
 
     try:
-        response_json = request_json("POST", endpoint, payload=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        response_json = request_json(
+            "POST",
+            endpoint,
+            payload=payload,
+            timeout=GEMINI_TIMEOUT_SECONDS,
+            retries=GEMINI_RETRIES,
+        )
         candidates = response_json.get("candidates", []) if isinstance(response_json, dict) else []
         for candidate in candidates:
             content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
@@ -528,6 +625,10 @@ def call_gemini_morse(text: str) -> Optional[str]:
         fallback = sanitize_morse_output(extract_text_from_payload(response_json))
         if fallback:
             return fallback
+    except urllib_error.HTTPError as exc:
+        if exc.code == 429:
+            activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
+        log(f"Gemini Flash Morse conversion failed: {exc}")
     except Exception as exc:
         log(f"Gemini Flash Morse conversion failed: {exc}")
 
@@ -537,6 +638,8 @@ def call_gemini_morse(text: str) -> Optional[str]:
 def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MODEL) -> Optional[str]:
     if not GEMINI_API_KEY:
         log("GEMINI_API_KEY is not configured.")
+        return None
+    if not gemini_available():
         return None
 
     try:
@@ -565,7 +668,13 @@ def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MO
                 "maxOutputTokens": 64,
             },
         }
-        response_json = request_json("POST", endpoint, payload=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        response_json = request_json(
+            "POST",
+            endpoint,
+            payload=payload,
+            timeout=GEMINI_TIMEOUT_SECONDS,
+            retries=GEMINI_RETRIES,
+        )
         candidates = response_json.get("candidates", []) if isinstance(response_json, dict) else []
         for candidate in candidates:
             content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
@@ -580,12 +689,23 @@ def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MO
                 return " ".join(text_parts).strip()
         fallback_text = extract_text_from_payload(response_json)
         return fallback_text or None
+    except urllib_error.HTTPError as exc:
+        if exc.code == 429:
+            activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
+        log(f"Gemini vision call failed: {exc}")
+        return None
     except Exception as exc:
         log(f"Gemini vision call failed: {exc}")
         return None
 
 
 def detect_human_gemma(image_path: Path) -> Optional[str]:
+    if not GEMMA_LOCAL_URL:
+        log("GEMMA_LOCAL_URL is not configured; using fallback result.")
+        return None
+    if not gemma_available():
+        return None
+
     image_base64 = encode_image_base64(image_path)
     prompt = "Answer with only YES or NO. Is a human present in this image?"
     payload = {
@@ -601,7 +721,13 @@ def detect_human_gemma(image_path: Path) -> Optional[str]:
     }
 
     try:
-        response_json = request_json("POST", GEMMA_LOCAL_URL, payload=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        response_json = request_json(
+            "POST",
+            GEMMA_LOCAL_URL,
+            payload=payload,
+            timeout=GEMMA_TIMEOUT_SECONDS,
+            retries=GEMMA_RETRIES,
+        )
         response_text = extract_text_from_payload(response_json)
         response_text = normalize_text(response_text).upper()
         if "YES" in response_text:
@@ -614,6 +740,7 @@ def detect_human_gemma(image_path: Path) -> Optional[str]:
             return "NO"
         return None
     except Exception as exc:
+        mark_gemma_temporarily_unavailable()
         log(f"Gemma local detection failed: {exc}")
         return None
 
@@ -642,6 +769,15 @@ def control_leds(*, heartbeat: Optional[bool] = None, processing: Optional[bool]
         GPIO.output(LED3_PIN, GPIO.HIGH if LED_ALERT_STATE else GPIO.LOW)
     except Exception as exc:
         log(f"LED control failed: {exc}")
+
+
+def set_obstacle_mode_led(enabled: bool) -> None:
+    global LED_OBSTACLE_MODE_STATE
+    LED_OBSTACLE_MODE_STATE = enabled
+    try:
+        GPIO.output(OBSTACLE_MODE_LED_PIN, GPIO.HIGH if enabled else GPIO.LOW)
+    except Exception as exc:
+        log(f"Obstacle mode LED control failed: {exc}")
 
 
 def navigation_band_from_distance(distance_cm: float) -> str:
@@ -924,10 +1060,12 @@ def setup_gpio() -> None:
     GPIO.setup(LED1_PIN, GPIO.OUT)
     GPIO.setup(LED2_PIN, GPIO.OUT)
     GPIO.setup(LED3_PIN, GPIO.OUT)
+    GPIO.setup(OBSTACLE_MODE_LED_PIN, GPIO.OUT)
     GPIO.setup(NAV_GUIDANCE_LED_PIN, GPIO.OUT)
     GPIO.setup(TRIG_PIN, GPIO.OUT)
     GPIO.setup(ECHO_PIN, GPIO.IN)
     GPIO.output(TRIG_PIN, GPIO.LOW)
+    GPIO.output(OBSTACLE_MODE_LED_PIN, GPIO.LOW)
     control_leds(heartbeat=False, processing=False, alert=False)
 
 
@@ -935,6 +1073,7 @@ def cleanup_gpio() -> None:
     try:
         GPIO.output(VIBRATION_PIN, GPIO.LOW)
         GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.LOW)
+        GPIO.output(OBSTACLE_MODE_LED_PIN, GPIO.LOW)
         GPIO.output(LED1_PIN, GPIO.LOW)
         GPIO.output(LED2_PIN, GPIO.LOW)
         GPIO.output(LED3_PIN, GPIO.LOW)
@@ -1095,6 +1234,20 @@ def send_obstacle_warning(morse_worker: MorseWorker) -> None:
     play_haptic(morse_worker, "..", prefix_key=None)
 
 
+def handle_obstacle_awareness_toggle(morse_worker: MorseWorker, currently_enabled: bool) -> bool:
+    next_enabled = not currently_enabled
+    status_text = "enabled" if next_enabled else "disabled"
+    log(f"Button 2 long press: ultrasonic obstacle awareness {status_text}")
+    set_obstacle_mode_led(next_enabled)
+
+    if next_enabled:
+        play_haptic(morse_worker, ".-", prefix_key=None)
+    else:
+        control_leds(alert=False)
+        play_haptic(morse_worker, "-...", prefix_key=None)
+    return next_enabled
+
+
 def main() -> None:
     setup_gpio()
     morse_worker = MorseWorker()
@@ -1111,12 +1264,15 @@ def main() -> None:
     log("System started.")
     log(f"GPIO backend: {GPIO.mode}")
     if not GEMINI_API_KEY:
-        log("GEMINI_API_KEY is not configured; AI modes will only log failures.")
+        log("GEMINI_API_KEY is not configured; Gemini calls will use local fallbacks.")
+    if not GEMMA_LOCAL_URL:
+        log("GEMMA_LOCAL_URL is not configured; human detection falls back to NO.")
 
     last_caretaker_poll = 0.0
     last_distance_poll = 0.0
     last_heartbeat_toggle = 0.0
     heartbeat_on = False
+    obstacle_awareness_enabled = ENABLE_OBSTACLE_AWARENESS
     obstacle_active = False
     last_obstacle_alert_at = 0.0
     last_nav_guidance_at = 0.0
@@ -1124,6 +1280,16 @@ def main() -> None:
 
     button1_state = ButtonState()
     button2_state = ButtonState()
+
+    set_obstacle_mode_led(obstacle_awareness_enabled)
+    log(f"Ultrasonic obstacle awareness: {'enabled' if obstacle_awareness_enabled else 'disabled'}")
+
+    def _toggle_obstacle_awareness() -> None:
+        nonlocal obstacle_awareness_enabled, obstacle_active, last_nav_band
+        obstacle_awareness_enabled = handle_obstacle_awareness_toggle(morse_worker, obstacle_awareness_enabled)
+        if not obstacle_awareness_enabled:
+            obstacle_active = False
+            last_nav_band = None
 
     try:
         while not stop_event.is_set():
@@ -1139,7 +1305,7 @@ def main() -> None:
                     handle_caretaker_message(morse_worker, caretaker_message)
                 last_caretaker_poll = now
 
-            if (now - last_distance_poll) >= DISTANCE_POLL_SECONDS:
+            if obstacle_awareness_enabled and (now - last_distance_poll) >= DISTANCE_POLL_SECONDS:
                 distance_cm = measure_distance()
                 if distance_cm is not None and distance_cm < OBSTACLE_THRESHOLD_CM:
                     obstacle_active = True
@@ -1160,6 +1326,9 @@ def main() -> None:
                         last_nav_band = nav_band
                         last_nav_guidance_at = now
                 last_distance_poll = now
+            elif not obstacle_awareness_enabled and obstacle_active:
+                obstacle_active = False
+                control_leds(alert=False)
 
             handle_button_input(
                 now,
@@ -1181,6 +1350,7 @@ def main() -> None:
                 MEDIUM_PRESS_SECONDS,
                 LONG_PRESS_SECONDS,
                 short_action=lambda: handle_message_check(morse_worker),
+                long_action=_toggle_obstacle_awareness,
             )
 
             if not obstacle_active and not LED_ALERT_STATE:
