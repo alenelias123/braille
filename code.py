@@ -24,6 +24,7 @@ import queue
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -37,6 +38,11 @@ from typing import Any, Dict, List, Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+
+try:
+    import certifi  # type: ignore
+except Exception:
+    certifi = None  # type: ignore
 
 
 try:
@@ -277,15 +283,19 @@ REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "10"))
 REQUEST_RETRIES = max(0, int(os.getenv("REQUEST_RETRIES", "1")))
 REQUEST_RETRY_BASE_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_BASE_DELAY_SECONDS", "0.35"))
 REQUEST_RETRY_MAX_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_MAX_DELAY_SECONDS", "3.0"))
+ALLOW_INSECURE_SSL = os.getenv("GEMINI_ALLOW_INSECURE_SSL", "0").strip().lower() in {"1", "true", "yes", "on"}
+GEMINI_CA_BUNDLE = os.getenv("GEMINI_CA_BUNDLE", "").strip()
 
 GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "6"))
 GEMINI_RETRIES = max(0, int(os.getenv("GEMINI_RETRIES", "0")))
 GEMINI_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
 GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
 
-GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "4"))
+GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "2.5"))
 GEMMA_RETRIES = max(0, int(os.getenv("GEMMA_RETRIES", "0")))
-GEMMA_FAILURE_COOLDOWN_SECONDS = float(os.getenv("GEMMA_FAILURE_COOLDOWN_SECONDS", "20"))
+GEMMA_FAILURE_COOLDOWN_SECONDS = float(os.getenv("GEMMA_FAILURE_COOLDOWN_SECONDS", "90"))
+GEMMA_FAILURE_COOLDOWN_MULTIPLIER = float(os.getenv("GEMMA_FAILURE_COOLDOWN_MULTIPLIER", "2.0"))
+GEMMA_MAX_COOLDOWN_SECONDS = float(os.getenv("GEMMA_MAX_COOLDOWN_SECONDS", "900"))
 GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
 
 IMAGE_DIRECTORY = Path(os.getenv("IMAGE_DIRECTORY", str(Path(tempfile.gettempdir()) / "assistive_images")))
@@ -297,8 +307,9 @@ SOS_API_URL = os.getenv("SOS_API_URL", "").strip()
 SOS_API_TOKEN = os.getenv("SOS_API_TOKEN", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDeer2H_t1KwQW9vbBZX1ufBDVqeGgGmKo").strip() #api key not found 
-GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash").strip()
-GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-pro").strip()
+GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
+GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", GEMINI_DEFAULT_MODEL).strip()
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").strip()
 
 GEMMA_LOCAL_URL = os.getenv("GEMMA_LOCAL_URL", "http://localhost:11434/api/chat").strip() # error
@@ -317,6 +328,7 @@ _GEMINI_BACKOFF_UNTIL = 0.0
 _LAST_GEMINI_BACKOFF_LOG_AT = 0.0
 _GEMMA_BACKOFF_UNTIL = 0.0
 _LAST_GEMMA_BACKOFF_LOG_AT = 0.0
+_GEMMA_FAILURE_STREAK = 0
 
 
 MORSE_CODE: Dict[str, str] = {
@@ -433,7 +445,7 @@ def extract_text_from_payload(payload: Any) -> str:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        for key in ("messages", "data", "choices", "parts", "candidates"):
+        for key in ("messages", "data", "choices", "parts", "candidates", "content"):
             value = payload.get(key)
             if value:
                 text = extract_text_from_payload(value)
@@ -472,6 +484,77 @@ def retry_delay_seconds(exc: Exception, attempt: int) -> float:
     return min(REQUEST_RETRY_MAX_DELAY_SECONDS, exponential)
 
 
+def is_ssl_verification_error(exc: Exception) -> bool:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    if isinstance(exc, urllib_error.URLError) and isinstance(exc.reason, ssl.SSLCertVerificationError):
+        return True
+    return "certificate verify failed" in str(exc).lower()
+
+
+def collect_ca_bundle_candidates(cli_override: Optional[str] = None) -> List[str]:
+    candidates: List[str] = []
+
+    if cli_override and cli_override.strip():
+        candidates.append(cli_override.strip())
+    if GEMINI_CA_BUNDLE:
+        candidates.append(GEMINI_CA_BUNDLE)
+
+    for env_name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        bundle_path = os.getenv(env_name, "").strip()
+        if bundle_path:
+            candidates.append(bundle_path)
+
+    try:
+        default_paths = ssl.get_default_verify_paths()
+        if default_paths.cafile:
+            candidates.append(default_paths.cafile)
+    except Exception:
+        pass
+
+    if certifi is not None:
+        try:
+            candidates.append(certifi.where())
+        except Exception:
+            pass
+
+    candidates.extend(
+        [
+            r"/etc/ssl/certs/ca-certificates.crt",
+            r"/etc/pki/tls/certs/ca-bundle.crt",
+            r"/etc/ssl/cert.pem",
+            r"C:\Program Files\Git\usr\ssl\certs\ca-bundle.crt",
+            r"C:\Program Files\Git\mingw64\ssl\certs\ca-bundle.crt",
+            r"C:\msys64\ucrt64\etc\ssl\cert.pem",
+            r"C:\msys64\mingw64\etc\ssl\cert.pem",
+            r"C:\msys64\usr\ssl\cert.pem",
+        ]
+    )
+
+    unique_candidates: List[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        normalized = str(Path(path).expanduser())
+        if normalized not in seen:
+            seen.add(normalized)
+            unique_candidates.append(normalized)
+    return unique_candidates
+
+
+def build_ssl_context(cli_ca_bundle: Optional[str] = None) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    for candidate in collect_ca_bundle_candidates(cli_ca_bundle):
+        candidate_path = Path(candidate).expanduser()
+        if not candidate_path.exists() or not candidate_path.is_file():
+            continue
+        try:
+            context.load_verify_locations(cafile=str(candidate_path))
+            return context
+        except Exception:
+            continue
+    return context
+
+
 def request_json(
     method: str,
     url: str,
@@ -479,6 +562,8 @@ def request_json(
     headers: Optional[Dict[str, str]] = None,
     timeout: float = REQUEST_TIMEOUT_SECONDS,
     retries: int = REQUEST_RETRIES,
+    log_failures: bool = True,
+    ca_bundle: Optional[str] = None,
 ) -> Any:
     request_headers = {
         "Content-Type": "application/json",
@@ -490,22 +575,39 @@ def request_json(
     body = None
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
+    ssl_context = build_ssl_context(ca_bundle)
 
     last_error: Optional[Exception] = None
     attempt_count = max(1, retries + 1)
     for attempt in range(1, attempt_count + 1):
+        request = urllib_request.Request(url, data=body, headers=request_headers, method=method.upper())
         try:
-            request = urllib_request.Request(url, data=body, headers=request_headers, method=method.upper())
-            with urllib_request.urlopen(request, timeout=timeout) as response:
+            with urllib_request.urlopen(request, timeout=timeout, context=ssl_context) as response:
                 response_text = response.read().decode("utf-8", errors="replace")
                 if not response_text.strip():
                     return {}
                 return json.loads(response_text)
         except Exception as exc:
-            last_error = exc
-            log(f"Request attempt {attempt}/{attempt_count} failed for {url}: {exc}")
-            if attempt < attempt_count and should_retry_request_error(exc):
-                time.sleep(retry_delay_seconds(exc, attempt))
+            failure: Exception = exc
+            if ALLOW_INSECURE_SSL and is_ssl_verification_error(exc):
+                log("SSL verification failed; retrying once with insecure SSL mode enabled.")
+                try:
+                    insecure_context = ssl._create_unverified_context()
+                    with urllib_request.urlopen(request, timeout=timeout, context=insecure_context) as response:
+                        response_text = response.read().decode("utf-8", errors="replace")
+                        if not response_text.strip():
+                            return {}
+                        return json.loads(response_text)
+                except Exception as insecure_exc:
+                    failure = insecure_exc
+                    if log_failures:
+                        log(f"Insecure SSL retry failed for {url}: {insecure_exc}")
+
+            last_error = failure
+            if log_failures:
+                log(f"Request attempt {attempt}/{attempt_count} failed for {url}: {failure}")
+            if attempt < attempt_count and should_retry_request_error(failure):
+                time.sleep(retry_delay_seconds(failure, attempt))
                 continue
             break
 
@@ -533,9 +635,23 @@ def gemini_available() -> bool:
     return False
 
 
+def gemini_cooldown_active() -> bool:
+    return (time.monotonic() < _GEMINI_BACKOFF_UNTIL)
+
+
 def mark_gemma_temporarily_unavailable() -> None:
-    global _GEMMA_BACKOFF_UNTIL
-    _GEMMA_BACKOFF_UNTIL = max(_GEMMA_BACKOFF_UNTIL, time.monotonic() + GEMMA_FAILURE_COOLDOWN_SECONDS)
+    global _GEMMA_BACKOFF_UNTIL, _GEMMA_FAILURE_STREAK
+    _GEMMA_FAILURE_STREAK += 1
+    cooldown = GEMMA_FAILURE_COOLDOWN_SECONDS * (GEMMA_FAILURE_COOLDOWN_MULTIPLIER ** max(0, _GEMMA_FAILURE_STREAK - 1))
+    cooldown = min(GEMMA_MAX_COOLDOWN_SECONDS, max(1.0, cooldown))
+    _GEMMA_BACKOFF_UNTIL = max(_GEMMA_BACKOFF_UNTIL, time.monotonic() + cooldown)
+    log(f"Gemma local disabled for {cooldown:.0f}s (failure streak: {_GEMMA_FAILURE_STREAK}).")
+
+
+def mark_gemma_healthy() -> None:
+    global _GEMMA_FAILURE_STREAK, _GEMMA_BACKOFF_UNTIL
+    _GEMMA_FAILURE_STREAK = 0
+    _GEMMA_BACKOFF_UNTIL = 0.0
 
 
 def gemma_available() -> bool:
@@ -636,6 +752,11 @@ def call_gemini_morse(text: str) -> Optional[str]:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
         log(f"Gemini Flash Morse conversion failed: {exc}")
     except Exception as exc:
+        if is_ssl_verification_error(exc):
+            log(
+                "Gemini TLS verification failed. Set GEMINI_CA_BUNDLE or SSL_CERT_FILE "
+                "to a valid CA bundle path."
+            )
         log(f"Gemini Flash Morse conversion failed: {exc}")
 
     return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
@@ -662,7 +783,7 @@ def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MO
                         {"text": prompt},
                         {
                             "inline_data": {
-                                "mime_type": "image/jpeg",
+                                "mime_type": guess_mime_type(image_path),
                                 "data": image_base64,
                             }
                         },
@@ -701,6 +822,11 @@ def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MO
         log(f"Gemini vision call failed: {exc}")
         return None
     except Exception as exc:
+        if is_ssl_verification_error(exc):
+            log(
+                "Gemini TLS verification failed. Set GEMINI_CA_BUNDLE or SSL_CERT_FILE "
+                "to a valid CA bundle path."
+            )
         log(f"Gemini vision call failed: {exc}")
         return None
 
@@ -733,7 +859,9 @@ def detect_human_gemma(image_path: Path) -> Optional[str]:
             payload=payload,
             timeout=GEMMA_TIMEOUT_SECONDS,
             retries=GEMMA_RETRIES,
+            log_failures=False,
         )
+        mark_gemma_healthy()
         response_text = extract_text_from_payload(response_json)
         response_text = normalize_text(response_text).upper()
         if "YES" in response_text:
@@ -829,6 +957,17 @@ def encode_image_base64(image_path: Path) -> str:
     with image_path.open("rb") as image_file:
         encoded_bytes = base64.b64encode(image_file.read())
     return encoded_bytes.decode("ascii")
+
+
+def guess_mime_type(path: Path) -> str:
+    extension = path.suffix.lower()
+    if extension in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if extension == ".png":
+        return "image/png"
+    if extension == ".webp":
+        return "image/webp"
+    return "application/octet-stream"
 
 
 def capture_image(prefix: str) -> Optional[Path]:
@@ -1222,9 +1361,14 @@ def handle_person_priority_room_scan(morse_worker: MorseWorker) -> None:
         return
 
     try:
+        gemini_on_cooldown = gemini_cooldown_active()
         response_text = build_room_description(image_path, prioritize_person=True)
         person_from_vision, room_summary = parse_person_priority_response(response_text)
-        person_from_local = detect_human_gemma(image_path)
+        person_from_local: Optional[str] = None
+        if not gemini_on_cooldown and response_text != "UNKNOWN AREA":
+            person_from_local = detect_human_gemma(image_path)
+        else:
+            log("Skipping Gemma check because Gemini is cooling down or unavailable.")
 
         person_present = person_from_local == "YES"
         if person_from_local is None and person_from_vision is not None:
