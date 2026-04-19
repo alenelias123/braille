@@ -446,6 +446,10 @@ PERSON_ALERT_LED_ON = False
 PERSON_ALERT_LAST_TOGGLE_AT = 0.0
 _GEMINI_BACKOFF_UNTIL = 0.0
 _LAST_GEMINI_BACKOFF_LOG_AT = 0.0
+MORSE_WORKER_SHUTDOWN_TIMEOUT_SECONDS = float(os.getenv("MORSE_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5.0"))
+MAX_HTTP_ERROR_BODY_CHARS = int(os.getenv("MAX_HTTP_ERROR_BODY_CHARS", "500"))
+GEMINI_AUTH_ERROR_CODES = {401, 403}
+GEMINI_CLIENT_ERROR_CODES = {400, 401, 403, 404}
 
 
 MORSE_CODE: Dict[str, str] = {
@@ -801,7 +805,7 @@ def extract_http_error_details(exc: urllib_error.HTTPError) -> str:
     try:
         body = exc.read().decode("utf-8", errors="replace").strip()
         if body:
-            detail = f"{detail} | {body[:500]}"
+            detail = f"{detail} | {body[:MAX_HTTP_ERROR_BODY_CHARS]}"
     except Exception:
         pass
     return detail
@@ -979,17 +983,17 @@ def call_gemini_flash(text: str) -> Optional[str]:
                 if morse_text:
                     return morse_text
             except urllib_error.HTTPError as exc:
-                auth_error_seen = auth_error_seen or exc.code in {401, 403}
+                auth_error_seen = auth_error_seen or exc.code in GEMINI_AUTH_ERROR_CODES
                 if exc.code == 429:
                     activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
                     break
-                if exc.code not in {400, 401, 403, 404}:
+                if exc.code not in GEMINI_CLIENT_ERROR_CODES:
                     raise
                 continue
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
-        elif exc.code in {401, 403}:
+        elif exc.code in GEMINI_AUTH_ERROR_CODES:
             activate_gemini_auth_cooldown()
         log(f"Gemini Flash Morse conversion failed: {extract_http_error_details(exc)}")
     except Exception as exc:
@@ -1070,11 +1074,11 @@ def call_gemini_vision(
                 if response_text:
                     return response_text
             except urllib_error.HTTPError as exc:
-                auth_error_seen = auth_error_seen or exc.code in {401, 403}
+                auth_error_seen = auth_error_seen or exc.code in GEMINI_AUTH_ERROR_CODES
                 if exc.code == 429:
                     activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
                     break
-                if exc.code not in {400, 401, 403, 404}:
+                if exc.code not in GEMINI_CLIENT_ERROR_CODES:
                     raise
                 continue
         if auth_error_seen:
@@ -1084,7 +1088,7 @@ def call_gemini_vision(
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
-        elif exc.code in {401, 403}:
+        elif exc.code in GEMINI_AUTH_ERROR_CODES:
             activate_gemini_auth_cooldown()
         log(f"Gemini vision call failed: {extract_http_error_details(exc)}")
         return None
@@ -1447,7 +1451,7 @@ class MorseWorker:
     def stop(self) -> None:
         self.stop_event.set()
         self.queue.put(MorseTask(""))
-        self.thread.join(timeout=5.0)
+        self.thread.join(timeout=MORSE_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
         if self.thread.is_alive():
             log("Morse worker did not stop within timeout; forcing GPIO cleanup path.")
 
