@@ -2,12 +2,12 @@
 """Assistive system for deafblind users on Raspberry Pi.
 
 Features:
-- Button 1 short press: SOS alert.
-- Button 1 medium press: room summary converted to Morse.
-- Button 1 double press: person-priority room scan with vibration + blinking red alert.
-- Button 1 long press: human presence detection using local Gemma.
-- Button 2 short press: fetch a server message and convert it to Morse.
-- Button 2 long press: toggle ultrasonic obstacle awareness mode LED.
+- Button 1 short press: toggle navigation mode (ultrasonic guidance).
+- Button 1 medium press: fetch incoming caretaker message and play Morse.
+- Button 1 long press: sign-language capture, AI correction, Braille output.
+- Button 2 short press: room description mode (vision -> Morse).
+- Button 2 medium press: human presence detection (YES/NO -> Morse).
+- Button 2 long press: SOS alert with haptic confirmation.
 - Ultrasonic obstacle awareness and LED status indicators.
 
 The script is designed to keep working even when some hardware or APIs are
@@ -38,6 +38,102 @@ from typing import Any, Dict, List, Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_env_refs(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _resolve_env_refs(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_env_refs(v) for v in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("${") and stripped.endswith("}") and len(stripped) > 3:
+            env_name = stripped[2:-1].strip()
+            return os.getenv(env_name, "")
+    return value
+
+
+def load_api_config(path: Path) -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "gemini_flash": {
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+            "api_key": "${GEMINI_API_KEY}",
+            "timeout_seconds": 6,
+            "retries": 1,
+            "max_output_tokens": 64,
+        },
+        "gemini_vision": {
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+            "api_key": "${GEMINI_API_KEY}",
+            "timeout_seconds": 8,
+            "retries": 1,
+            "max_output_tokens": 80,
+        },
+        "sign_language": {
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+            "api_key": "${GEMINI_API_KEY}",
+            "timeout_seconds": 8,
+            "retries": 1,
+            "max_output_tokens": 96,
+        },
+        "caretaker": {
+            "endpoint": "${CARETAKER_API_URL}",
+            "token": "${CARETAKER_API_TOKEN}",
+            "timeout_seconds": 10,
+        },
+        "sos": {
+            "endpoint": "${SOS_API_URL}",
+            "token": "${SOS_API_TOKEN}",
+            "timeout_seconds": 10,
+        },
+        "gemma_local": {
+            "endpoint": "http://localhost:11434/api/chat",
+            "model": "gemma3",
+            "timeout_seconds": 3,
+            "retries": 1,
+        },
+    }
+
+    loaded: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                loaded = {}
+        except Exception:
+            loaded = {}
+    merged = _deep_merge(defaults, loaded)
+    return _resolve_env_refs(merged)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv_file(PROJECT_ROOT / ".env")
+API_CONFIG_PATH = Path(os.getenv("API_CONFIG_PATH", str(PROJECT_ROOT / "api_config.json")))
+API_CONFIG = load_api_config(API_CONFIG_PATH)
 
 try:
     import certifi  # type: ignore
@@ -286,13 +382,38 @@ REQUEST_RETRY_MAX_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_MAX_DELAY_SECON
 ALLOW_INSECURE_SSL = os.getenv("GEMINI_ALLOW_INSECURE_SSL", "0").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_CA_BUNDLE = os.getenv("GEMINI_CA_BUNDLE", "").strip()
 
-GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "6"))
-GEMINI_RETRIES = max(0, int(os.getenv("GEMINI_RETRIES", "0")))
+GEMINI_FLASH_CONFIG = API_CONFIG.get("gemini_flash", {}) if isinstance(API_CONFIG, dict) else {}
+GEMINI_VISION_CONFIG = API_CONFIG.get("gemini_vision", {}) if isinstance(API_CONFIG, dict) else {}
+SIGN_LANGUAGE_CONFIG = API_CONFIG.get("sign_language", {}) if isinstance(API_CONFIG, dict) else {}
+CARETAKER_CONFIG = API_CONFIG.get("caretaker", {}) if isinstance(API_CONFIG, dict) else {}
+SOS_CONFIG = API_CONFIG.get("sos", {}) if isinstance(API_CONFIG, dict) else {}
+GEMMA_CONFIG = API_CONFIG.get("gemma_local", {}) if isinstance(API_CONFIG, dict) else {}
+
+GEMINI_FLASH_ENDPOINT = str(GEMINI_FLASH_CONFIG.get("endpoint", "")).strip()
+GEMINI_FLASH_API_KEY = str(GEMINI_FLASH_CONFIG.get("api_key", "")).strip()
+GEMINI_FLASH_TIMEOUT_SECONDS = float(GEMINI_FLASH_CONFIG.get("timeout_seconds", 6))
+GEMINI_FLASH_RETRIES = max(0, int(GEMINI_FLASH_CONFIG.get("retries", 1)))
+GEMINI_FLASH_MAX_OUTPUT_TOKENS = int(GEMINI_FLASH_CONFIG.get("max_output_tokens", 64))
+
+GEMINI_VISION_ENDPOINT = str(GEMINI_VISION_CONFIG.get("endpoint", "")).strip()
+GEMINI_VISION_API_KEY = str(GEMINI_VISION_CONFIG.get("api_key", GEMINI_FLASH_API_KEY)).strip()
+GEMINI_VISION_TIMEOUT_SECONDS = float(GEMINI_VISION_CONFIG.get("timeout_seconds", 8))
+GEMINI_VISION_RETRIES = max(0, int(GEMINI_VISION_CONFIG.get("retries", 1)))
+GEMINI_VISION_MAX_OUTPUT_TOKENS = int(GEMINI_VISION_CONFIG.get("max_output_tokens", 80))
+
+SIGN_LANGUAGE_ENDPOINT = str(SIGN_LANGUAGE_CONFIG.get("endpoint", GEMINI_VISION_ENDPOINT)).strip()
+SIGN_LANGUAGE_API_KEY = str(SIGN_LANGUAGE_CONFIG.get("api_key", GEMINI_VISION_API_KEY)).strip()
+SIGN_LANGUAGE_TIMEOUT_SECONDS = float(SIGN_LANGUAGE_CONFIG.get("timeout_seconds", GEMINI_VISION_TIMEOUT_SECONDS))
+SIGN_LANGUAGE_RETRIES = max(0, int(SIGN_LANGUAGE_CONFIG.get("retries", GEMINI_VISION_RETRIES)))
+SIGN_LANGUAGE_MAX_OUTPUT_TOKENS = int(SIGN_LANGUAGE_CONFIG.get("max_output_tokens", 96))
+
+GEMINI_TIMEOUT_SECONDS = GEMINI_VISION_TIMEOUT_SECONDS
+GEMINI_RETRIES = GEMINI_VISION_RETRIES
 GEMINI_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
 GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
 
-GEMMA_TIMEOUT_SECONDS = float(os.getenv("GEMMA_TIMEOUT_SECONDS", "2.5"))
-GEMMA_RETRIES = max(0, int(os.getenv("GEMMA_RETRIES", "0")))
+GEMMA_TIMEOUT_SECONDS = float(GEMMA_CONFIG.get("timeout_seconds", os.getenv("GEMMA_TIMEOUT_SECONDS", "2.5")))
+GEMMA_RETRIES = max(0, int(GEMMA_CONFIG.get("retries", os.getenv("GEMMA_RETRIES", "0"))))
 GEMMA_FAILURE_COOLDOWN_SECONDS = float(os.getenv("GEMMA_FAILURE_COOLDOWN_SECONDS", "90"))
 GEMMA_FAILURE_COOLDOWN_MULTIPLIER = float(os.getenv("GEMMA_FAILURE_COOLDOWN_MULTIPLIER", "2.0"))
 GEMMA_MAX_COOLDOWN_SECONDS = float(os.getenv("GEMMA_MAX_COOLDOWN_SECONDS", "900"))
@@ -300,20 +421,27 @@ GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMMA_COOLDOWN_LOG_INTERV
 
 IMAGE_DIRECTORY = Path(os.getenv("IMAGE_DIRECTORY", str(Path(tempfile.gettempdir()) / "assistive_images")))
 
-CARETAKER_API_URL = os.getenv("CARETAKER_API_URL", os.getenv("CAREGIVER_API_URL", "")).strip()
-CARETAKER_API_TOKEN = os.getenv("CARETAKER_API_TOKEN", os.getenv("CAREGIVER_API_TOKEN", "")).strip()
+CARETAKER_API_URL = str(CARETAKER_CONFIG.get("endpoint", os.getenv("CARETAKER_API_URL", os.getenv("CAREGIVER_API_URL", "")))).strip()
+CARETAKER_API_TOKEN = str(CARETAKER_CONFIG.get("token", os.getenv("CARETAKER_API_TOKEN", os.getenv("CAREGIVER_API_TOKEN", "")))).strip()
+CARETAKER_API_TIMEOUT_SECONDS = float(CARETAKER_CONFIG.get("timeout_seconds", REQUEST_TIMEOUT_SECONDS))
 ENABLE_CARETAKER_POLL = os.getenv("ENABLE_CARETAKER_POLL", "0").strip().lower() in {"1", "true", "yes", "on"}
-SOS_API_URL = os.getenv("SOS_API_URL", "").strip()
-SOS_API_TOKEN = os.getenv("SOS_API_TOKEN", "").strip()
+SOS_API_URL = str(SOS_CONFIG.get("endpoint", os.getenv("SOS_API_URL", ""))).strip()
+SOS_API_TOKEN = str(SOS_CONFIG.get("token", os.getenv("SOS_API_TOKEN", ""))).strip()
+SOS_API_TIMEOUT_SECONDS = float(SOS_CONFIG.get("timeout_seconds", REQUEST_TIMEOUT_SECONDS))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDeer2H_t1KwQW9vbBZX1ufBDVqeGgGmKo").strip() #api key not found 
+GEMINI_API_KEY = GEMINI_FLASH_API_KEY or GEMINI_VISION_API_KEY or os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
 GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").strip()
 
-GEMMA_LOCAL_URL = os.getenv("GEMMA_LOCAL_URL", "http://localhost:11434/api/chat").strip() # error
-GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma3").strip()
+GEMMA_LOCAL_URL = str(GEMMA_CONFIG.get("endpoint", os.getenv("GEMMA_LOCAL_URL", "http://localhost:11434/api/chat"))).strip()
+GEMMA_MODEL = str(GEMMA_CONFIG.get("model", os.getenv("GEMMA_MODEL", "gemma3"))).strip()
+
+NAVIGATION_SAFE_DISTANCE_CM = float(os.getenv("NAVIGATION_SAFE_DISTANCE_CM", "150"))
+NAVIGATION_MIN_PULSE_INTERVAL_SECONDS = float(os.getenv("NAVIGATION_MIN_PULSE_INTERVAL_SECONDS", "0.18"))
+NAVIGATION_MAX_PULSE_INTERVAL_SECONDS = float(os.getenv("NAVIGATION_MAX_PULSE_INTERVAL_SECONDS", "0.95"))
+NAVIGATION_MODE_ENABLED = False
 
 LED_HEARTBEAT_STATE = False
 LED_PROCESSING_STATE = False
@@ -697,19 +825,28 @@ def sanitize_morse_output(text: str) -> str:
     return cleaned[:MAX_MORSE_CHARS * 4]
 
 
-def call_gemini_morse(text: str) -> Optional[str]:
-    if not GEMINI_API_KEY:
-        log("GEMINI_API_KEY is not configured for Morse conversion.")
-        return sanitize_morse_output(text_to_morse_local(text)) or None
-    if not gemini_available():
-        return sanitize_morse_output(text_to_morse_local(text)) or None
+def _append_api_key(endpoint: str, api_key: str) -> str:
+    if not endpoint:
+        return endpoint
+    parsed = urllib_parse.urlparse(endpoint)
+    query_pairs = urllib_parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query_map = dict(query_pairs)
+    if api_key and "key" not in query_map:
+        query_pairs.append(("key", api_key))
+    new_query = urllib_parse.urlencode(query_pairs)
+    return urllib_parse.urlunparse(parsed._replace(query=new_query))
 
-    cleaned_text = clamp_text_for_prompt(text, max_chars=20)
-    prompt = f"Convert the following text into Morse code using dots and dashes only. Keep it short: {cleaned_text}"
-    endpoint = (
-        f"{GEMINI_API_BASE}/models/{urllib_parse.quote(GEMINI_FLASH_MODEL, safe='')}:generateContent"
-        f"?key={urllib_parse.quote(GEMINI_API_KEY, safe='')}"
-    )
+
+def call_gemini_flash(text: str) -> Optional[str]:
+    cleaned_text = clamp_text_for_prompt(text, max_chars=MAX_MORSE_CHARS)
+    if not GEMINI_FLASH_API_KEY or not GEMINI_FLASH_ENDPOINT:
+        log("Gemini Flash API config missing; using local Morse conversion.")
+        return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
+    if not gemini_available():
+        return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
+
+    prompt = f"Convert this text into Morse code using only dots and dashes: {cleaned_text}"
+    endpoint = _append_api_key(GEMINI_FLASH_ENDPOINT, GEMINI_FLASH_API_KEY)
     payload = {
         "contents": [
             {
@@ -719,7 +856,7 @@ def call_gemini_morse(text: str) -> Optional[str]:
         ],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 64,
+            "maxOutputTokens": GEMINI_FLASH_MAX_OUTPUT_TOKENS,
         },
     }
 
@@ -728,25 +865,13 @@ def call_gemini_morse(text: str) -> Optional[str]:
             "POST",
             endpoint,
             payload=payload,
-            timeout=GEMINI_TIMEOUT_SECONDS,
-            retries=GEMINI_RETRIES,
+            timeout=GEMINI_FLASH_TIMEOUT_SECONDS,
+            retries=GEMINI_FLASH_RETRIES,
         )
-        candidates = response_json.get("candidates", []) if isinstance(response_json, dict) else []
-        for candidate in candidates:
-            content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
-            parts = content.get("parts", []) if isinstance(content, dict) else []
-            text_parts: List[str] = []
-            for part in parts:
-                if isinstance(part, dict):
-                    value = part.get("text")
-                    if isinstance(value, str) and value.strip():
-                        text_parts.append(value.strip())
-            morse_text = sanitize_morse_output(" ".join(text_parts))
-            if morse_text:
-                return morse_text
-        fallback = sanitize_morse_output(extract_text_from_payload(response_json))
-        if fallback:
-            return fallback
+        result_text = extract_text_from_payload(response_json)
+        morse_text = sanitize_morse_output(result_text)
+        if morse_text:
+            return morse_text
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
@@ -762,19 +887,31 @@ def call_gemini_morse(text: str) -> Optional[str]:
     return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
 
 
-def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MODEL) -> Optional[str]:
-    if not GEMINI_API_KEY:
-        log("GEMINI_API_KEY is not configured.")
+def call_gemini_vision(
+    image_path: Path,
+    prompt: str,
+    *,
+    endpoint: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+    retries: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+) -> Optional[str]:
+    selected_endpoint = (endpoint or GEMINI_VISION_ENDPOINT).strip()
+    selected_api_key = (api_key or GEMINI_VISION_API_KEY).strip()
+    selected_timeout = timeout_seconds if timeout_seconds is not None else GEMINI_VISION_TIMEOUT_SECONDS
+    selected_retries = retries if retries is not None else GEMINI_VISION_RETRIES
+    selected_max_tokens = max_output_tokens if max_output_tokens is not None else GEMINI_VISION_MAX_OUTPUT_TOKENS
+
+    if not selected_endpoint or not selected_api_key:
+        log("Gemini Vision API config missing.")
         return None
     if not gemini_available():
         return None
 
     try:
-        image_base64 = encode_image_base64(image_path)
-        endpoint = (
-            f"{GEMINI_API_BASE}/models/{urllib_parse.quote(model, safe='')}:generateContent"
-            f"?key={urllib_parse.quote(GEMINI_API_KEY, safe='')}"
-        )
+        image_base64 = encode_base64(image_path)
+        request_url = _append_api_key(selected_endpoint, selected_api_key)
         payload = {
             "contents": [
                 {
@@ -792,30 +929,18 @@ def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MO
             ],
             "generationConfig": {
                 "temperature": 0.2,
-                "maxOutputTokens": 64,
+                "maxOutputTokens": int(selected_max_tokens),
             },
         }
         response_json = request_json(
             "POST",
-            endpoint,
+            request_url,
             payload=payload,
-            timeout=GEMINI_TIMEOUT_SECONDS,
-            retries=GEMINI_RETRIES,
+            timeout=float(selected_timeout),
+            retries=max(0, int(selected_retries)),
         )
-        candidates = response_json.get("candidates", []) if isinstance(response_json, dict) else []
-        for candidate in candidates:
-            content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
-            parts = content.get("parts", []) if isinstance(content, dict) else []
-            text_parts: List[str] = []
-            for part in parts:
-                if isinstance(part, dict):
-                    text_value = part.get("text")
-                    if isinstance(text_value, str) and text_value.strip():
-                        text_parts.append(text_value.strip())
-            if text_parts:
-                return " ".join(text_parts).strip()
-        fallback_text = extract_text_from_payload(response_json)
-        return fallback_text or None
+        response_text = extract_text_from_payload(response_json)
+        return response_text or None
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
@@ -829,6 +954,15 @@ def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MO
             )
         log(f"Gemini vision call failed: {exc}")
         return None
+
+
+def call_gemini_morse(text: str) -> Optional[str]:
+    return call_gemini_flash(text)
+
+
+def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MODEL) -> Optional[str]:
+    _ = model
+    return call_gemini_vision(image_path, prompt)
 
 
 def detect_human_gemma(image_path: Path) -> Optional[str]:
@@ -953,10 +1087,14 @@ def send_navigation_guidance(morse_worker: "MorseWorker", distance_cm: float) ->
         play_haptic(morse_worker, morse_pattern)
 
 
-def encode_image_base64(image_path: Path) -> str:
+def encode_base64(image_path: Path) -> str:
     with image_path.open("rb") as image_file:
         encoded_bytes = base64.b64encode(image_file.read())
     return encoded_bytes.decode("ascii")
+
+
+def encode_image_base64(image_path: Path) -> str:
+    return encode_base64(image_path)
 
 
 def guess_mime_type(path: Path) -> str:
@@ -1094,7 +1232,7 @@ def build_room_description(image_path: Path, *, prioritize_person: bool = False)
             "PERSON:YES|NO; DESC:<3 to 6 words about room>."
         )
     else:
-        prompt = "Describe what is in this room in 3 to 6 short words."
+        prompt = "Describe the room in 3-5 short words for navigation"
 
     response_text = call_gemini_api(image_path, prompt, model=GEMINI_VISION_MODEL)
     if not response_text:
@@ -1135,7 +1273,7 @@ def post_sos_alert() -> bool:
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
     try:
-        request_json("POST", SOS_API_URL, payload=payload, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        request_json("POST", SOS_API_URL, payload=payload, headers=headers, timeout=SOS_API_TIMEOUT_SECONDS, retries=1)
         log("SOS alert sent successfully.")
         return True
     except Exception as exc:
@@ -1152,7 +1290,7 @@ def poll_caretaker_messages() -> List[str]:
         headers["Authorization"] = f"Bearer {CARETAKER_API_TOKEN}"
 
     try:
-        payload = request_json("GET", CARETAKER_API_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        payload = request_json("GET", CARETAKER_API_URL, headers=headers, timeout=CARETAKER_API_TIMEOUT_SECONDS, retries=1)
     except Exception as exc:
         log(f"Caretaker poll failed: {exc}")
         return []
@@ -1300,92 +1438,129 @@ def play_haptic(morse_worker: MorseWorker, pattern: str, prefix_key: Optional[st
     morse_worker.submit(combined)
 
 
+def play_morse(morse_worker: MorseWorker, pattern: str, prefix_key: Optional[str] = None) -> None:
+    """Primary Morse output helper required by the final system design."""
+    play_haptic(morse_worker, pattern, prefix_key=prefix_key)
+
+
+BRAILLE_MAP: Dict[str, str] = {
+    "a": "⠁", "b": "⠃", "c": "⠉", "d": "⠙", "e": "⠑", "f": "⠋", "g": "⠛", "h": "⠓", "i": "⠊", "j": "⠚",
+    "k": "⠅", "l": "⠇", "m": "⠍", "n": "⠝", "o": "⠕", "p": "⠏", "q": "⠟", "r": "⠗", "s": "⠎", "t": "⠞",
+    "u": "⠥", "v": "⠧", "w": "⠺", "x": "⠭", "y": "⠽", "z": "⠵",
+    "0": "⠚", "1": "⠁", "2": "⠃", "3": "⠉", "4": "⠙", "5": "⠑", "6": "⠋", "7": "⠛", "8": "⠓", "9": "⠊",
+    " ": " ", ".": "⠲", ",": "⠂", "?": "⠦", "!": "⠖", "-": "⠤", ":": "⠒", ";": "⠆", "/": "⠌",
+}
+BRAILLE_NUMBER_PREFIX = "⠼"
+
+
+def text_to_braille_script(text: str) -> str:
+    cleaned = normalize_text(text).lower()
+    output: List[str] = []
+    for character in cleaned:
+        if character.isdigit():
+            output.append(BRAILLE_NUMBER_PREFIX + BRAILLE_MAP.get(character, ""))
+            continue
+        output.append(BRAILLE_MAP.get(character, "⠿"))
+    return "".join(output).strip()
+
+
+def navigation_pulse_interval_seconds(distance_cm: float) -> float:
+    """Dynamic pulse frequency: closer object -> faster feedback."""
+    if distance_cm > NAVIGATION_SAFE_DISTANCE_CM:
+        return NAVIGATION_MAX_PULSE_INTERVAL_SECONDS
+    minimum_distance = 10.0
+    clamped = max(minimum_distance, min(NAVIGATION_SAFE_DISTANCE_CM, distance_cm))
+    ratio = (clamped - minimum_distance) / (NAVIGATION_SAFE_DISTANCE_CM - minimum_distance)
+    interval = NAVIGATION_MIN_PULSE_INTERVAL_SECONDS + (
+        (NAVIGATION_MAX_PULSE_INTERVAL_SECONDS - NAVIGATION_MIN_PULSE_INTERVAL_SECONDS) * ratio
+    )
+    return max(NAVIGATION_MIN_PULSE_INTERVAL_SECONDS, min(NAVIGATION_MAX_PULSE_INTERVAL_SECONDS, interval))
+
+
+def handle_room_description_mode(morse_worker: MorseWorker) -> None:
+    log("Button 2 short press: room description mode")
+    set_person_alert_mode(False)
+    control_leds(processing=True)
+    image_path = capture_image("room_desc")
+    if image_path is None:
+        play_morse(morse_worker, "...", prefix_key="room_scan")
+        control_leds(processing=False)
+        return
+
+    try:
+        prompt = "Describe the room in 3-5 short words for navigation"
+        room_text = call_gemini_vision(image_path, prompt) or "UNKNOWN AREA"
+        short_room_text = sanitize_room_output(room_text)
+        morse_pattern = call_gemini_flash(short_room_text) or text_to_morse_local(short_room_text)
+        play_morse(morse_worker, morse_pattern, prefix_key="room_scan")
+    finally:
+        control_leds(processing=False)
+
+
+def handle_human_presence_mode(morse_worker: MorseWorker) -> None:
+    log("Button 2 medium press: human presence detection")
+    set_person_alert_mode(False)
+    control_leds(processing=True)
+    image_path = capture_image("human_presence")
+    if image_path is None:
+        play_morse(morse_worker, "...", prefix_key="detection")
+        control_leds(processing=False)
+        return
+
+    try:
+        prompt = "Answer with only YES or NO. Is a human present in this image?"
+        response_text = call_gemini_vision(image_path, prompt)
+        detection_result = sanitize_detection_output(response_text or "")
+        if detection_result not in {"YES", "NO"}:
+            local_result = detect_human_gemma(image_path)
+            detection_result = local_result if local_result in {"YES", "NO"} else "NO"
+        morse_pattern = call_gemini_flash(detection_result) or text_to_morse_local(detection_result)
+        play_morse(morse_worker, morse_pattern, prefix_key="detection")
+    finally:
+        control_leds(processing=False)
+
+
+def handle_sign_language_mode(morse_worker: MorseWorker) -> None:
+    log("Button 1 long press: sign language mode")
+    set_person_alert_mode(False)
+    control_leds(processing=True)
+    image_path = capture_image("sign_language")
+    if image_path is None:
+        play_morse(morse_worker, "...", prefix_key=None)
+        control_leds(processing=False)
+        return
+
+    try:
+        prompt = (
+            "Recognize sign language from this image. "
+            "Auto-correct the recognized text and return only the corrected plain text."
+        )
+        recognized_text = call_gemini_vision(
+            image_path,
+            prompt,
+            endpoint=SIGN_LANGUAGE_ENDPOINT,
+            api_key=SIGN_LANGUAGE_API_KEY,
+            timeout_seconds=SIGN_LANGUAGE_TIMEOUT_SECONDS,
+            retries=SIGN_LANGUAGE_RETRIES,
+            max_output_tokens=SIGN_LANGUAGE_MAX_OUTPUT_TOKENS,
+        )
+        cleaned_text = normalize_text(recognized_text or "NO SIGN DETECTED")
+        braille_text = text_to_braille_script(cleaned_text)
+        log(f"Sign language text: {cleaned_text}")
+        log(f"Braille output: {braille_text}")
+        confirmation_morse = call_gemini_flash(cleaned_text) or text_to_morse_local(cleaned_text)
+        play_morse(morse_worker, confirmation_morse)
+    finally:
+        control_leds(processing=False)
+
+
 def handle_sos(morse_worker: MorseWorker) -> None:
-    log("Button 1 short press: SOS")
+    log("Button 2 long press: SOS mode")
     set_person_alert_mode(False)
     control_leds(processing=True)
     try:
         post_sos_alert()
-        play_haptic(morse_worker, "", prefix_key="sos")
-    finally:
-        control_leds(processing=False)
-
-
-def handle_detection(morse_worker: MorseWorker) -> None:
-    log("Button 1 long press: human presence check")
-    set_person_alert_mode(False)
-    control_leds(processing=True)
-    image_path = capture_image("detection")
-    if image_path is None:
-        play_haptic(morse_worker, "...", prefix_key="detection")
-        control_leds(processing=False)
-        return
-
-    try:
-        detection_result = detect_human_gemma(image_path)
-        if not detection_result:
-            detection_result = "NO"
-
-        morse_pattern = text_to_morse_local(detection_result)
-        play_haptic(morse_worker, morse_pattern, prefix_key="detection")
-    finally:
-        control_leds(processing=False)
-
-
-def handle_room_scan(morse_worker: MorseWorker) -> None:
-    log("Button 1 medium press: room description")
-    set_person_alert_mode(False)
-    control_leds(processing=True)
-    image_path = capture_image("roomscan")
-    if image_path is None:
-        play_haptic(morse_worker, "...", prefix_key="room_scan")
-        control_leds(processing=False)
-        return
-
-    try:
-        response_text = build_room_description(image_path, prioritize_person=False)
-        room_summary = sanitize_room_output(response_text)
-        morse_pattern = text_to_morse_local(room_summary)
-        play_haptic(morse_worker, morse_pattern, prefix_key="room_scan")
-    finally:
-        control_leds(processing=False)
-
-
-def handle_person_priority_room_scan(morse_worker: MorseWorker) -> None:
-    log("Button 1 double press: person-priority room scan")
-    control_leds(processing=True)
-    image_path = capture_image("room_priority")
-    if image_path is None:
-        play_haptic(morse_worker, "...", prefix_key="room_scan")
-        control_leds(processing=False)
-        return
-
-    try:
-        gemini_on_cooldown = gemini_cooldown_active()
-        response_text = build_room_description(image_path, prioritize_person=True)
-        person_from_vision, room_summary = parse_person_priority_response(response_text)
-        person_from_local: Optional[str] = None
-        if not gemini_on_cooldown and response_text != "UNKNOWN AREA":
-            person_from_local = detect_human_gemma(image_path)
-        else:
-            log("Skipping Gemma check because Gemini is cooling down or unavailable.")
-
-        person_present = person_from_local == "YES"
-        if person_from_local is None and person_from_vision is not None:
-            person_present = person_from_vision
-        if person_from_local is None and person_from_vision is None:
-            person_present = description_mentions_person(room_summary)
-
-        if person_present:
-            set_person_alert_mode(True)
-            play_haptic(morse_worker, "--- ---", prefix_key=None)
-            message_text = f"PERSON {room_summary}"
-        else:
-            set_person_alert_mode(False)
-            message_text = room_summary
-
-        morse_pattern = text_to_morse_local(message_text)
-        play_haptic(morse_worker, morse_pattern, prefix_key="room_scan")
+        play_morse(morse_worker, "... --- ...", prefix_key="sos")
     finally:
         control_leds(processing=False)
 
@@ -1398,7 +1573,7 @@ def fetch_server_message() -> Optional[str]:
 
 
 def handle_message_check(morse_worker: MorseWorker) -> None:
-    log("Button 2 press: manual message check")
+    log("Button 1 medium press: incoming message check")
     control_leds(processing=True)
     try:
         message = fetch_server_message()
@@ -1406,10 +1581,10 @@ def handle_message_check(morse_worker: MorseWorker) -> None:
             log("No message available from server.")
             return
 
-        morse_pattern = call_gemini_morse(message)
+        morse_pattern = call_gemini_flash(message)
         if not morse_pattern:
             morse_pattern = text_to_morse_local(message)
-        play_haptic(morse_worker, morse_pattern)
+        play_morse(morse_worker, morse_pattern)
     finally:
         control_leds(processing=False)
 
@@ -1419,10 +1594,52 @@ def handle_caretaker_message(morse_worker: MorseWorker, message: str) -> None:
     if not short_message:
         return
     log(f"Caretaker message received: {short_message}")
-    morse_pattern = call_gemini_morse(short_message)
+    morse_pattern = call_gemini_flash(short_message)
     if not morse_pattern:
         morse_pattern = text_to_morse_local(short_message)
     morse_worker.submit(morse_pattern)
+
+
+def handle_detection(morse_worker: MorseWorker) -> None:
+    """Backward-compatible wrapper."""
+    handle_human_presence_mode(morse_worker)
+
+
+def handle_room_scan(morse_worker: MorseWorker) -> None:
+    """Backward-compatible wrapper."""
+    handle_room_description_mode(morse_worker)
+
+
+def handle_person_priority_room_scan(morse_worker: MorseWorker) -> None:
+    """Backward-compatible wrapper retained for older integrations."""
+    handle_room_description_mode(morse_worker)
+
+
+def handle_button1(press_type: str, morse_worker: MorseWorker) -> None:
+    global NAVIGATION_MODE_ENABLED
+    if press_type == "short":
+        NAVIGATION_MODE_ENABLED = not NAVIGATION_MODE_ENABLED
+        set_obstacle_mode_led(NAVIGATION_MODE_ENABLED)
+        status_word = "ON" if NAVIGATION_MODE_ENABLED else "OFF"
+        log(f"Button 1 short press: navigation mode {status_word}")
+        play_morse(morse_worker, ".-" if NAVIGATION_MODE_ENABLED else "-...")
+        return
+    if press_type == "medium":
+        handle_message_check(morse_worker)
+        return
+    if press_type == "long":
+        handle_sign_language_mode(morse_worker)
+
+
+def handle_button2(press_type: str, morse_worker: MorseWorker) -> None:
+    if press_type == "short":
+        handle_room_description_mode(morse_worker)
+        return
+    if press_type == "medium":
+        handle_human_presence_mode(morse_worker)
+        return
+    if press_type == "long":
+        handle_sos(morse_worker)
 
 
 def button_is_pressed() -> bool:
@@ -1492,6 +1709,7 @@ def handle_obstacle_awareness_toggle(morse_worker: MorseWorker, currently_enable
 
 
 def main() -> None:
+    global NAVIGATION_MODE_ENABLED
     setup_gpio()
     morse_worker = MorseWorker()
     morse_worker.start()
@@ -1510,62 +1728,46 @@ def main() -> None:
         log("GEMINI_API_KEY is not configured; Gemini calls will use local fallbacks.")
     if not GEMMA_LOCAL_URL:
         log("GEMMA_LOCAL_URL is not configured; human detection falls back to NO.")
+    if not API_CONFIG_PATH.exists():
+        log(f"Warning: API config file not found at {API_CONFIG_PATH}; using defaults/env.")
 
     last_caretaker_poll = 0.0
     last_distance_poll = 0.0
     last_heartbeat_toggle = 0.0
     heartbeat_on = False
-    obstacle_awareness_enabled = ENABLE_OBSTACLE_AWARENESS
+    obstacle_awareness_enabled = NAVIGATION_MODE_ENABLED
     obstacle_active = False
     last_obstacle_alert_at = 0.0
-    last_nav_guidance_at = 0.0
-    last_nav_band: Optional[str] = None
 
     button1_state = ButtonState()
     button2_state = ButtonState()
-    button1_double_press_state = DoublePressState()
 
     set_obstacle_mode_led(obstacle_awareness_enabled)
-    log(f"Ultrasonic obstacle awareness: {'enabled' if obstacle_awareness_enabled else 'disabled'}")
-
-    def _toggle_obstacle_awareness() -> None:
-        nonlocal obstacle_awareness_enabled, obstacle_active, last_nav_band
-        obstacle_awareness_enabled = handle_obstacle_awareness_toggle(morse_worker, obstacle_awareness_enabled)
-        if not obstacle_awareness_enabled:
-            obstacle_active = False
-            last_nav_band = None
+    log(f"Navigation mode: {'enabled' if obstacle_awareness_enabled else 'disabled'}")
 
     def _button1_short_press() -> None:
-        now_local = time.monotonic()
-        if (
-            button1_double_press_state.waiting_second_press
-            and (now_local - button1_double_press_state.first_press_at) <= DOUBLE_PRESS_WINDOW_SECONDS
-        ):
-            button1_double_press_state.waiting_second_press = False
-            handle_person_priority_room_scan(morse_worker)
-            return
-
-        button1_double_press_state.waiting_second_press = True
-        button1_double_press_state.first_press_at = now_local
+        nonlocal obstacle_awareness_enabled
+        handle_button1("short", morse_worker)
+        obstacle_awareness_enabled = NAVIGATION_MODE_ENABLED
 
     def _button1_medium_press() -> None:
-        button1_double_press_state.waiting_second_press = False
-        handle_room_scan(morse_worker)
+        handle_button1("medium", morse_worker)
 
     def _button1_long_press() -> None:
-        button1_double_press_state.waiting_second_press = False
-        handle_detection(morse_worker)
+        handle_button1("long", morse_worker)
+
+    def _button2_short_press() -> None:
+        handle_button2("short", morse_worker)
+
+    def _button2_medium_press() -> None:
+        handle_button2("medium", morse_worker)
+
+    def _button2_long_press() -> None:
+        handle_button2("long", morse_worker)
 
     try:
         while not stop_event.is_set():
             now = time.monotonic()
-
-            if (
-                button1_double_press_state.waiting_second_press
-                and (now - button1_double_press_state.first_press_at) > DOUBLE_PRESS_WINDOW_SECONDS
-            ):
-                button1_double_press_state.waiting_second_press = False
-                handle_sos(morse_worker)
 
             if (now - last_heartbeat_toggle) >= 1.0:
                 heartbeat_on = not heartbeat_on
@@ -1579,22 +1781,15 @@ def main() -> None:
 
             if obstacle_awareness_enabled and (now - last_distance_poll) >= DISTANCE_POLL_SECONDS:
                 distance_cm = measure_distance()
-                if distance_cm is not None and distance_cm < OBSTACLE_THRESHOLD_CM:
+                if distance_cm is not None and distance_cm <= NAVIGATION_SAFE_DISTANCE_CM:
                     obstacle_active = True
-                    if (now - last_obstacle_alert_at) >= OBSTACLE_ALERT_COOLDOWN_SECONDS:
-                        send_obstacle_warning(morse_worker)
+                    pulse_interval = navigation_pulse_interval_seconds(distance_cm)
+                    if (now - last_obstacle_alert_at) >= pulse_interval:
+                        if morse_worker.queue.qsize() <= 2:
+                            play_morse(morse_worker, ".")
                         last_obstacle_alert_at = now
                 else:
                     obstacle_active = False
-
-                # Distance-based Morse guidance for navigation.
-                if ENABLE_NAV_MORSE_GUIDANCE and distance_cm is not None:
-                    nav_band = navigation_band_from_distance(distance_cm)
-                    should_announce = nav_band != last_nav_band and (now - last_nav_guidance_at) >= NAV_GUIDANCE_MIN_INTERVAL_SECONDS
-                    if should_announce:
-                        send_navigation_guidance(morse_worker, distance_cm)
-                        last_nav_band = nav_band
-                        last_nav_guidance_at = now
                 last_distance_poll = now
             elif not obstacle_awareness_enabled and obstacle_active:
                 obstacle_active = False
@@ -1618,8 +1813,9 @@ def main() -> None:
                 SHORT_PRESS_SECONDS,
                 MEDIUM_PRESS_SECONDS,
                 LONG_PRESS_SECONDS,
-                short_action=lambda: handle_message_check(morse_worker),
-                long_action=_toggle_obstacle_awareness,
+                short_action=_button2_short_press,
+                medium_action=_button2_medium_press,
+                long_action=_button2_long_press,
             )
 
             person_alert_led = update_person_alert_led(now)
