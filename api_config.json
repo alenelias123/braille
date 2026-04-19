@@ -1,0 +1,39 @@
+{
+  "gemini_flash": {
+    "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+    "api_key": "${GEMINI_API_KEY}",
+    "timeout_seconds": 6,
+    "retries": 1,
+    "max_output_tokens": 64
+  },
+  "gemini_vision": {
+    "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+    "api_key": "${GEMINI_API_KEY}",
+    "timeout_seconds": 8,
+    "retries": 1,
+    "max_output_tokens": 80
+  },
+  "sign_language": {
+    "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+    "api_key": "${GEMINI_API_KEY}",
+    "timeout_seconds": 8,
+    "retries": 1,
+    "max_output_tokens": 96
+  },
+  "caretaker": {
+    "endpoint": "${CARETAKER_API_URL}",
+    "token": "${CARETAKER_API_TOKEN}",
+    "timeout_seconds": 10
+  },
+  "sos": {
+    "endpoint": "${SOS_API_URL}",
+    "token": "${SOS_API_TOKEN}",
+    "timeout_seconds": 10
+  },
+  "gemma_local": {
+    "endpoint": "http://localhost:11434/api/chat",
+    "model": "gemma3",
+    "timeout_seconds": 3,
+    "retries": 1
+  }
+}
