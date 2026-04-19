@@ -110,12 +110,6 @@ def load_api_config(path: Path) -> Dict[str, Any]:
             "token": "${SOS_API_TOKEN}",
             "timeout_seconds": 10,
         },
-        "gemma_local": {
-            "endpoint": "http://localhost:11434/api/chat",
-            "model": "gemma3",
-            "timeout_seconds": 3,
-            "retries": 1,
-        },
     }
 
     loaded: Dict[str, Any] = {}
@@ -387,7 +381,6 @@ GEMINI_VISION_CONFIG = API_CONFIG.get("gemini_vision", {}) if isinstance(API_CON
 SIGN_LANGUAGE_CONFIG = API_CONFIG.get("sign_language", {}) if isinstance(API_CONFIG, dict) else {}
 CARETAKER_CONFIG = API_CONFIG.get("caretaker", {}) if isinstance(API_CONFIG, dict) else {}
 SOS_CONFIG = API_CONFIG.get("sos", {}) if isinstance(API_CONFIG, dict) else {}
-GEMMA_CONFIG = API_CONFIG.get("gemma_local", {}) if isinstance(API_CONFIG, dict) else {}
 
 GEMINI_FLASH_ENDPOINT = str(GEMINI_FLASH_CONFIG.get("endpoint", "")).strip()
 GEMINI_FLASH_API_KEY = str(GEMINI_FLASH_CONFIG.get("api_key", "")).strip()
@@ -411,13 +404,7 @@ GEMINI_TIMEOUT_SECONDS = GEMINI_VISION_TIMEOUT_SECONDS
 GEMINI_RETRIES = GEMINI_VISION_RETRIES
 GEMINI_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
 GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMINI_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
-
-GEMMA_TIMEOUT_SECONDS = float(GEMMA_CONFIG.get("timeout_seconds", os.getenv("GEMMA_TIMEOUT_SECONDS", "2.5")))
-GEMMA_RETRIES = max(0, int(GEMMA_CONFIG.get("retries", os.getenv("GEMMA_RETRIES", "0"))))
-GEMMA_FAILURE_COOLDOWN_SECONDS = float(os.getenv("GEMMA_FAILURE_COOLDOWN_SECONDS", "90"))
-GEMMA_FAILURE_COOLDOWN_MULTIPLIER = float(os.getenv("GEMMA_FAILURE_COOLDOWN_MULTIPLIER", "2.0"))
-GEMMA_MAX_COOLDOWN_SECONDS = float(os.getenv("GEMMA_MAX_COOLDOWN_SECONDS", "900"))
-GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS = float(os.getenv("GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS", "8"))
+GEMINI_AUTH_COOLDOWN_SECONDS = float(os.getenv("GEMINI_AUTH_COOLDOWN_SECONDS", "900"))
 
 IMAGE_DIRECTORY = Path(os.getenv("IMAGE_DIRECTORY", str(Path(tempfile.gettempdir()) / "assistive_images")))
 
@@ -428,15 +415,13 @@ ENABLE_CARETAKER_POLL = os.getenv("ENABLE_CARETAKER_POLL", "0").strip().lower() 
 SOS_API_URL = str(SOS_CONFIG.get("endpoint", os.getenv("SOS_API_URL", ""))).strip()
 SOS_API_TOKEN = str(SOS_CONFIG.get("token", os.getenv("SOS_API_TOKEN", ""))).strip()
 SOS_API_TIMEOUT_SECONDS = float(SOS_CONFIG.get("timeout_seconds", REQUEST_TIMEOUT_SECONDS))
+ENABLE_APP_SERVICE_APIS = os.getenv("ENABLE_APP_SERVICE_APIS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 GEMINI_API_KEY = GEMINI_FLASH_API_KEY or GEMINI_VISION_API_KEY or os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
 GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").strip()
-
-GEMMA_LOCAL_URL = str(GEMMA_CONFIG.get("endpoint", os.getenv("GEMMA_LOCAL_URL", "http://localhost:11434/api/chat"))).strip()
-GEMMA_MODEL = str(GEMMA_CONFIG.get("model", os.getenv("GEMMA_MODEL", "gemma3"))).strip()
 
 NAVIGATION_SAFE_DISTANCE_CM = float(os.getenv("NAVIGATION_SAFE_DISTANCE_CM", "150"))
 NAVIGATION_MIN_PULSE_INTERVAL_SECONDS = float(os.getenv("NAVIGATION_MIN_PULSE_INTERVAL_SECONDS", "0.18"))
@@ -454,9 +439,6 @@ PERSON_ALERT_LED_ON = False
 PERSON_ALERT_LAST_TOGGLE_AT = 0.0
 _GEMINI_BACKOFF_UNTIL = 0.0
 _LAST_GEMINI_BACKOFF_LOG_AT = 0.0
-_GEMMA_BACKOFF_UNTIL = 0.0
-_LAST_GEMMA_BACKOFF_LOG_AT = 0.0
-_GEMMA_FAILURE_STREAK = 0
 
 
 MORSE_CODE: Dict[str, str] = {
@@ -751,6 +733,16 @@ def activate_gemini_rate_limit(retry_after_seconds: Optional[float] = None) -> N
     _GEMINI_BACKOFF_UNTIL = max(_GEMINI_BACKOFF_UNTIL, time.monotonic() + cooldown)
 
 
+def activate_gemini_auth_cooldown() -> None:
+    global _GEMINI_BACKOFF_UNTIL
+    cooldown = max(60.0, GEMINI_AUTH_COOLDOWN_SECONDS)
+    _GEMINI_BACKOFF_UNTIL = max(_GEMINI_BACKOFF_UNTIL, time.monotonic() + cooldown)
+    log(
+        "Gemini auth/access error detected (401/403). "
+        f"Pausing Gemini calls for {cooldown:.0f}s and using local fallbacks."
+    )
+
+
 def gemini_available() -> bool:
     global _LAST_GEMINI_BACKOFF_LOG_AT
     now = time.monotonic()
@@ -765,33 +757,6 @@ def gemini_available() -> bool:
 
 def gemini_cooldown_active() -> bool:
     return (time.monotonic() < _GEMINI_BACKOFF_UNTIL)
-
-
-def mark_gemma_temporarily_unavailable() -> None:
-    global _GEMMA_BACKOFF_UNTIL, _GEMMA_FAILURE_STREAK
-    _GEMMA_FAILURE_STREAK += 1
-    cooldown = GEMMA_FAILURE_COOLDOWN_SECONDS * (GEMMA_FAILURE_COOLDOWN_MULTIPLIER ** max(0, _GEMMA_FAILURE_STREAK - 1))
-    cooldown = min(GEMMA_MAX_COOLDOWN_SECONDS, max(1.0, cooldown))
-    _GEMMA_BACKOFF_UNTIL = max(_GEMMA_BACKOFF_UNTIL, time.monotonic() + cooldown)
-    log(f"Gemma local disabled for {cooldown:.0f}s (failure streak: {_GEMMA_FAILURE_STREAK}).")
-
-
-def mark_gemma_healthy() -> None:
-    global _GEMMA_FAILURE_STREAK, _GEMMA_BACKOFF_UNTIL
-    _GEMMA_FAILURE_STREAK = 0
-    _GEMMA_BACKOFF_UNTIL = 0.0
-
-
-def gemma_available() -> bool:
-    global _LAST_GEMMA_BACKOFF_LOG_AT
-    now = time.monotonic()
-    remaining = _GEMMA_BACKOFF_UNTIL - now
-    if remaining <= 0:
-        return True
-    if now - _LAST_GEMMA_BACKOFF_LOG_AT >= GEMMA_COOLDOWN_LOG_INTERVAL_SECONDS:
-        log(f"Gemma local inference on cooldown for {remaining:.0f}s after recent failures.")
-        _LAST_GEMMA_BACKOFF_LOG_AT = now
-    return False
 
 
 def clamp_text_for_prompt(text: str, max_chars: int = 20) -> str:
@@ -825,16 +790,33 @@ def sanitize_morse_output(text: str) -> str:
     return cleaned[:MAX_MORSE_CHARS * 4]
 
 
-def _append_api_key(endpoint: str, api_key: str) -> str:
-    if not endpoint:
-        return endpoint
-    parsed = urllib_parse.urlparse(endpoint)
-    query_pairs = urllib_parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query_map = dict(query_pairs)
-    if api_key and "key" not in query_map:
-        query_pairs.append(("key", api_key))
-    new_query = urllib_parse.urlencode(query_pairs)
-    return urllib_parse.urlunparse(parsed._replace(query=new_query))
+def _build_gemini_generate_content_url(endpoint: str, api_key: str, fallback_model: str) -> str:
+    """Build Gemini URL in the same format as api_test.py.
+
+    Final format:
+      {api_base}/models/{urlencoded_model}:generateContent?key={urlencoded_key}
+    """
+    model = fallback_model.strip()
+    api_base = GEMINI_API_BASE.rstrip("/")
+
+    if endpoint:
+        parsed = urllib_parse.urlparse(endpoint)
+        path = (parsed.path or "").rstrip("/")
+        if parsed.scheme and parsed.netloc:
+            models_marker = "/models/"
+            if models_marker in path and path.endswith(":generateContent"):
+                base_path, model_part = path.split(models_marker, 1)
+                model_name = model_part.rsplit(":generateContent", 1)[0].strip()
+                if model_name:
+                    model = urllib_parse.unquote(model_name)
+                api_base = f"{parsed.scheme}://{parsed.netloc}{base_path}".rstrip("/")
+            else:
+                api_base = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+
+    return (
+        f"{api_base}/models/{urllib_parse.quote(model, safe='')}:generateContent"
+        f"?key={urllib_parse.quote(api_key, safe='')}"
+    )
 
 
 def call_gemini_flash(text: str) -> Optional[str]:
@@ -846,7 +828,11 @@ def call_gemini_flash(text: str) -> Optional[str]:
         return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
 
     prompt = f"Convert this text into Morse code using only dots and dashes: {cleaned_text}"
-    endpoint = _append_api_key(GEMINI_FLASH_ENDPOINT, GEMINI_FLASH_API_KEY)
+    endpoint = _build_gemini_generate_content_url(
+        GEMINI_FLASH_ENDPOINT,
+        GEMINI_FLASH_API_KEY,
+        GEMINI_FLASH_MODEL,
+    )
     payload = {
         "contents": [
             {
@@ -875,6 +861,8 @@ def call_gemini_flash(text: str) -> Optional[str]:
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
+        elif exc.code in {401, 403}:
+            activate_gemini_auth_cooldown()
         log(f"Gemini Flash Morse conversion failed: {exc}")
     except Exception as exc:
         if is_ssl_verification_error(exc):
@@ -911,7 +899,11 @@ def call_gemini_vision(
 
     try:
         image_base64 = encode_base64(image_path)
-        request_url = _append_api_key(selected_endpoint, selected_api_key)
+        request_url = _build_gemini_generate_content_url(
+            selected_endpoint,
+            selected_api_key,
+            GEMINI_VISION_MODEL,
+        )
         payload = {
             "contents": [
                 {
@@ -928,7 +920,7 @@ def call_gemini_vision(
                 }
             ],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.0,
                 "maxOutputTokens": int(selected_max_tokens),
             },
         }
@@ -944,6 +936,8 @@ def call_gemini_vision(
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
+        elif exc.code in {401, 403}:
+            activate_gemini_auth_cooldown()
         log(f"Gemini vision call failed: {exc}")
         return None
     except Exception as exc:
@@ -963,54 +957,6 @@ def call_gemini_morse(text: str) -> Optional[str]:
 def call_gemini_api(image_path: Path, prompt: str, model: str = GEMINI_VISION_MODEL) -> Optional[str]:
     _ = model
     return call_gemini_vision(image_path, prompt)
-
-
-def detect_human_gemma(image_path: Path) -> Optional[str]:
-    if not GEMMA_LOCAL_URL:
-        log("GEMMA_LOCAL_URL is not configured; using fallback result.")
-        return None
-    if not gemma_available():
-        return None
-
-    image_base64 = encode_image_base64(image_path)
-    prompt = "Answer with only YES or NO. Is a human present in this image?"
-    payload = {
-        "model": GEMMA_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-                "images": [image_base64],
-            }
-        ],
-        "stream": False,
-    }
-
-    try:
-        response_json = request_json(
-            "POST",
-            GEMMA_LOCAL_URL,
-            payload=payload,
-            timeout=GEMMA_TIMEOUT_SECONDS,
-            retries=GEMMA_RETRIES,
-            log_failures=False,
-        )
-        mark_gemma_healthy()
-        response_text = extract_text_from_payload(response_json)
-        response_text = normalize_text(response_text).upper()
-        if "YES" in response_text:
-            return "YES"
-        if "NO" in response_text:
-            return "NO"
-        if any(token in response_text for token in ("TRUE", "PRESENT", "PERSON", "HUMAN")):
-            return "YES"
-        if any(token in response_text for token in ("FALSE", "ABSENT", "NONE")):
-            return "NO"
-        return None
-    except Exception as exc:
-        mark_gemma_temporarily_unavailable()
-        log(f"Gemma local detection failed: {exc}")
-        return None
 
 
 def measure_distance() -> Optional[float]:
@@ -1259,6 +1205,9 @@ def parse_person_priority_response(text: str) -> tuple[Optional[bool], str]:
 
 
 def post_sos_alert() -> bool:
+    if not ENABLE_APP_SERVICE_APIS:
+        log("App-service APIs are disabled; SOS API call skipped.")
+        return False
     if not SOS_API_URL:
         log("SOS_API_URL is not configured; alert will be logged only.")
         return False
@@ -1282,6 +1231,8 @@ def post_sos_alert() -> bool:
 
 
 def poll_caretaker_messages() -> List[str]:
+    if not ENABLE_APP_SERVICE_APIS:
+        return []
     if not CARETAKER_API_URL:
         return []
 
@@ -1512,8 +1463,7 @@ def handle_human_presence_mode(morse_worker: MorseWorker) -> None:
         response_text = call_gemini_vision(image_path, prompt)
         detection_result = sanitize_detection_output(response_text or "")
         if detection_result not in {"YES", "NO"}:
-            local_result = detect_human_gemma(image_path)
-            detection_result = local_result if local_result in {"YES", "NO"} else "NO"
+            detection_result = "NO"
         morse_pattern = call_gemini_flash(detection_result) or text_to_morse_local(detection_result)
         play_morse(morse_worker, morse_pattern, prefix_key="detection")
     finally:
@@ -1726,8 +1676,6 @@ def main() -> None:
     log(f"GPIO backend: {GPIO.mode}")
     if not GEMINI_API_KEY:
         log("GEMINI_API_KEY is not configured; Gemini calls will use local fallbacks.")
-    if not GEMMA_LOCAL_URL:
-        log("GEMMA_LOCAL_URL is not configured; human detection falls back to NO.")
     if not API_CONFIG_PATH.exists():
         log(f"Warning: API config file not found at {API_CONFIG_PATH}; using defaults/env.")
 
