@@ -366,6 +366,7 @@ MORSE_DASH_SECONDS = float(os.getenv("MORSE_DASH_SECONDS", "0.60"))
 MORSE_ELEMENT_GAP = float(os.getenv("MORSE_ELEMENT_GAP", "0.15"))
 MORSE_LETTER_GAP = float(os.getenv("MORSE_LETTER_GAP", "0.45"))
 MORSE_WORD_GAP = float(os.getenv("MORSE_WORD_GAP", "0.90"))
+STOP_EVENT_CHECK_INTERVAL_SECONDS = float(os.getenv("STOP_EVENT_CHECK_INTERVAL_SECONDS", "0.02"))
 
 MAX_MORSE_CHARS = int(os.getenv("MAX_MORSE_CHARS", "18"))
 CARETAKER_POLL_SECONDS = float(os.getenv("CARETAKER_POLL_SECONDS", "10"))
@@ -511,6 +512,7 @@ MODE_PREFIXES = {
 
 
 def sanitize_log_message(message: str) -> str:
+    """Redact common secret patterns from log messages before printing."""
     sanitized = str(message)
     sanitized = re.sub(r"([?&](?:key|api_key|token|access_token)=)[^&\s]+", r"\1***", sanitized, flags=re.IGNORECASE)
     sanitized = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", sanitized, flags=re.IGNORECASE)
@@ -776,6 +778,7 @@ def gemini_cooldown_active() -> bool:
 
 
 def redact_url_for_logs(url: str) -> str:
+    """Redact sensitive query parameter values (for example API keys/tokens) in URLs."""
     try:
         parsed = urllib_parse.urlparse(url)
         if not parsed.query:
@@ -793,6 +796,7 @@ def redact_url_for_logs(url: str) -> str:
 
 
 def extract_http_error_details(exc: urllib_error.HTTPError) -> str:
+    """Return HTTPError text plus a truncated response body, when available."""
     detail = str(exc)
     try:
         body = exc.read().decode("utf-8", errors="replace").strip()
@@ -864,6 +868,7 @@ def _build_gemini_generate_content_url(endpoint: str, api_key: str, fallback_mod
 
 
 def _gemini_base_candidates(primary_base: str) -> List[str]:
+    """Return deduplicated Gemini API base candidates, including v1/v1beta fallbacks."""
     candidates: List[str] = []
 
     def _add(base: str) -> None:
@@ -882,6 +887,7 @@ def _gemini_base_candidates(primary_base: str) -> List[str]:
 
 
 def _gemini_model_candidates(primary_model: str) -> List[str]:
+    """Return deduplicated model candidates ordered from preferred to fallback options."""
     candidates: List[str] = []
 
     def _add(model_name: str) -> None:
@@ -1504,7 +1510,7 @@ class MorseWorker:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(0.02, remaining))
+            time.sleep(min(STOP_EVENT_CHECK_INTERVAL_SECONDS, remaining))
 
 
 def setup_gpio() -> None:

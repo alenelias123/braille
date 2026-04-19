@@ -16,7 +16,7 @@ Python prototype for a deafblind assistive device with:
 
 ## Requirements
 
-- Raspberry Pi (GPIO-capable), Python 3.9+
+- Raspberry Pi (GPIO-capable), Python 3.9 or later
 - Optional camera support:
   - `fswebcam` (used first if available)
   - `picamera2` (fallback)
