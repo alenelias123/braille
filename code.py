@@ -375,6 +375,7 @@ REQUEST_RETRY_BASE_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_BASE_DELAY_SEC
 REQUEST_RETRY_MAX_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_MAX_DELAY_SECONDS", "3.0"))
 ALLOW_INSECURE_SSL = os.getenv("GEMINI_ALLOW_INSECURE_SSL", "0").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_CA_BUNDLE = os.getenv("GEMINI_CA_BUNDLE", "").strip()
+GEMINI_USE_QUERY_API_KEY = os.getenv("GEMINI_USE_QUERY_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 GEMINI_FLASH_CONFIG = API_CONFIG.get("gemini_flash", {}) if isinstance(API_CONFIG, dict) else {}
 GEMINI_VISION_CONFIG = API_CONFIG.get("gemini_vision", {}) if isinstance(API_CONFIG, dict) else {}
@@ -422,6 +423,11 @@ GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip()
 GEMINI_FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", GEMINI_DEFAULT_MODEL).strip()
 GEMINI_API_BASE = os.getenv("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta").strip()
+GEMINI_MODEL_FALLBACKS = [
+    item.strip()
+    for item in os.getenv("GEMINI_MODEL_FALLBACKS", "gemini-2.0-flash,gemini-1.5-flash-latest,gemini-1.5-flash").split(",")
+    if item.strip()
+]
 
 NAVIGATION_SAFE_DISTANCE_CM = float(os.getenv("NAVIGATION_SAFE_DISTANCE_CM", "150"))
 NAVIGATION_MIN_PULSE_INTERVAL_SECONDS = float(os.getenv("NAVIGATION_MIN_PULSE_INTERVAL_SECONDS", "0.18"))
@@ -675,6 +681,7 @@ def request_json(
     log_failures: bool = True,
     ca_bundle: Optional[str] = None,
 ) -> Any:
+    redacted_url = redact_url_for_logs(url)
     request_headers = {
         "Content-Type": "application/json",
         "User-Agent": f"{APP_NAME}/1.0",
@@ -715,7 +722,7 @@ def request_json(
 
             last_error = failure
             if log_failures:
-                log(f"Request attempt {attempt}/{attempt_count} failed for {url}: {failure}")
+                log(f"Request attempt {attempt}/{attempt_count} failed for {redacted_url}: {failure}")
             if attempt < attempt_count and should_retry_request_error(failure):
                 time.sleep(retry_delay_seconds(failure, attempt))
                 continue
@@ -757,6 +764,34 @@ def gemini_available() -> bool:
 
 def gemini_cooldown_active() -> bool:
     return (time.monotonic() < _GEMINI_BACKOFF_UNTIL)
+
+
+def redact_url_for_logs(url: str) -> str:
+    try:
+        parsed = urllib_parse.urlparse(url)
+        if not parsed.query:
+            return url
+        sensitive_keys = {"key", "api_key", "token", "access_token"}
+        query_pairs = urllib_parse.parse_qsl(parsed.query, keep_blank_values=True)
+        redacted_pairs = [
+            (name, "***" if name.lower() in sensitive_keys else value)
+            for name, value in query_pairs
+        ]
+        redacted_query = urllib_parse.urlencode(redacted_pairs, doseq=True)
+        return urllib_parse.urlunparse(parsed._replace(query=redacted_query))
+    except Exception:
+        return url
+
+
+def extract_http_error_details(exc: urllib_error.HTTPError) -> str:
+    detail = str(exc)
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        if body:
+            detail = f"{detail} | {body[:500]}"
+    except Exception:
+        pass
+    return detail
 
 
 def clamp_text_for_prompt(text: str, max_chars: int = 20) -> str:
@@ -813,10 +848,76 @@ def _build_gemini_generate_content_url(endpoint: str, api_key: str, fallback_mod
             else:
                 api_base = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
 
-    return (
-        f"{api_base}/models/{urllib_parse.quote(model, safe='')}:generateContent"
-        f"?key={urllib_parse.quote(api_key, safe='')}"
-    )
+    base_url = f"{api_base}/models/{urllib_parse.quote(model, safe='')}:generateContent"
+    if GEMINI_USE_QUERY_API_KEY:
+        return f"{base_url}?key={urllib_parse.quote(api_key, safe='')}"
+    return base_url
+
+
+def _gemini_base_candidates(primary_base: str) -> List[str]:
+    candidates: List[str] = []
+
+    def _add(base: str) -> None:
+        normalized = base.rstrip("/")
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    _add(primary_base)
+    _add(GEMINI_API_BASE)
+    for base in list(candidates):
+        if "/v1beta" in base:
+            _add(base.replace("/v1beta", "/v1"))
+        elif base.endswith("/v1"):
+            _add(f"{base}beta")
+    return candidates
+
+
+def _gemini_model_candidates(primary_model: str) -> List[str]:
+    candidates: List[str] = []
+
+    def _add(model_name: str) -> None:
+        normalized = model_name.strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    _add(primary_model)
+    _add(GEMINI_DEFAULT_MODEL)
+    _add(GEMINI_FLASH_MODEL)
+    _add(GEMINI_VISION_MODEL)
+    for fallback_model in GEMINI_MODEL_FALLBACKS:
+        _add(fallback_model)
+    return candidates
+
+
+def build_gemini_candidate_urls(endpoint: str, api_key: str, fallback_model: str) -> List[str]:
+    """Create ordered endpoint/model candidates to improve compatibility across Gemini API versions."""
+    parsed = urllib_parse.urlparse(endpoint.strip()) if endpoint.strip() else None
+    extracted_model = fallback_model.strip()
+    extracted_base = GEMINI_API_BASE.rstrip("/")
+
+    if parsed and parsed.scheme and parsed.netloc:
+        path = (parsed.path or "").rstrip("/")
+        models_marker = "/models/"
+        if models_marker in path and path.endswith(":generateContent"):
+            base_path, model_part = path.split(models_marker, 1)
+            model_name = model_part.rsplit(":generateContent", 1)[0].strip()
+            if model_name:
+                extracted_model = urllib_parse.unquote(model_name)
+            extracted_base = f"{parsed.scheme}://{parsed.netloc}{base_path}".rstrip("/")
+        else:
+            extracted_base = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+
+    urls: List[str] = []
+    for base_candidate in _gemini_base_candidates(extracted_base):
+        for model_candidate in _gemini_model_candidates(extracted_model):
+            url = _build_gemini_generate_content_url(
+                f"{base_candidate}/models/{urllib_parse.quote(model_candidate, safe='')}:generateContent",
+                api_key,
+                model_candidate,
+            )
+            if url not in urls:
+                urls.append(url)
+    return urls
 
 
 def call_gemini_flash(text: str) -> Optional[str]:
@@ -828,11 +929,6 @@ def call_gemini_flash(text: str) -> Optional[str]:
         return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
 
     prompt = f"Convert this text into Morse code using only dots and dashes: {cleaned_text}"
-    endpoint = _build_gemini_generate_content_url(
-        GEMINI_FLASH_ENDPOINT,
-        GEMINI_FLASH_API_KEY,
-        GEMINI_FLASH_MODEL,
-    )
     payload = {
         "contents": [
             {
@@ -846,24 +942,41 @@ def call_gemini_flash(text: str) -> Optional[str]:
         },
     }
 
+    gemini_headers = {"x-goog-api-key": GEMINI_FLASH_API_KEY} if not GEMINI_USE_QUERY_API_KEY else None
+    auth_error_seen = False
     try:
-        response_json = request_json(
-            "POST",
-            endpoint,
-            payload=payload,
-            timeout=GEMINI_FLASH_TIMEOUT_SECONDS,
-            retries=GEMINI_FLASH_RETRIES,
-        )
-        result_text = extract_text_from_payload(response_json)
-        morse_text = sanitize_morse_output(result_text)
-        if morse_text:
-            return morse_text
+        for endpoint in build_gemini_candidate_urls(
+            GEMINI_FLASH_ENDPOINT,
+            GEMINI_FLASH_API_KEY,
+            GEMINI_FLASH_MODEL,
+        ):
+            try:
+                response_json = request_json(
+                    "POST",
+                    endpoint,
+                    payload=payload,
+                    headers=gemini_headers,
+                    timeout=GEMINI_FLASH_TIMEOUT_SECONDS,
+                    retries=GEMINI_FLASH_RETRIES,
+                )
+                result_text = extract_text_from_payload(response_json)
+                morse_text = sanitize_morse_output(result_text)
+                if morse_text:
+                    return morse_text
+            except urllib_error.HTTPError as exc:
+                auth_error_seen = auth_error_seen or exc.code in {401, 403}
+                if exc.code == 429:
+                    activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
+                    break
+                if exc.code not in {400, 401, 403, 404}:
+                    raise
+                continue
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
         elif exc.code in {401, 403}:
             activate_gemini_auth_cooldown()
-        log(f"Gemini Flash Morse conversion failed: {exc}")
+        log(f"Gemini Flash Morse conversion failed: {extract_http_error_details(exc)}")
     except Exception as exc:
         if is_ssl_verification_error(exc):
             log(
@@ -871,6 +984,9 @@ def call_gemini_flash(text: str) -> Optional[str]:
                 "to a valid CA bundle path."
             )
         log(f"Gemini Flash Morse conversion failed: {exc}")
+    if auth_error_seen:
+        activate_gemini_auth_cooldown()
+        log("Gemini Flash Morse conversion failed after trying fallback models/endpoints.")
 
     return sanitize_morse_output(text_to_morse_local(cleaned_text)) or None
 
@@ -899,11 +1015,6 @@ def call_gemini_vision(
 
     try:
         image_base64 = encode_base64(image_path)
-        request_url = _build_gemini_generate_content_url(
-            selected_endpoint,
-            selected_api_key,
-            GEMINI_VISION_MODEL,
-        )
         payload = {
             "contents": [
                 {
@@ -924,21 +1035,43 @@ def call_gemini_vision(
                 "maxOutputTokens": int(selected_max_tokens),
             },
         }
-        response_json = request_json(
-            "POST",
-            request_url,
-            payload=payload,
-            timeout=float(selected_timeout),
-            retries=max(0, int(selected_retries)),
-        )
-        response_text = extract_text_from_payload(response_json)
-        return response_text or None
+        gemini_headers = {"x-goog-api-key": selected_api_key} if not GEMINI_USE_QUERY_API_KEY else None
+        auth_error_seen = False
+        for request_url in build_gemini_candidate_urls(
+            selected_endpoint,
+            selected_api_key,
+            GEMINI_VISION_MODEL,
+        ):
+            try:
+                response_json = request_json(
+                    "POST",
+                    request_url,
+                    payload=payload,
+                    headers=gemini_headers,
+                    timeout=float(selected_timeout),
+                    retries=max(0, int(selected_retries)),
+                )
+                response_text = extract_text_from_payload(response_json)
+                if response_text:
+                    return response_text
+            except urllib_error.HTTPError as exc:
+                auth_error_seen = auth_error_seen or exc.code in {401, 403}
+                if exc.code == 429:
+                    activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
+                    break
+                if exc.code not in {400, 401, 403, 404}:
+                    raise
+                continue
+        if auth_error_seen:
+            activate_gemini_auth_cooldown()
+            log("Gemini vision call failed after trying fallback models/endpoints.")
+        return None
     except urllib_error.HTTPError as exc:
         if exc.code == 429:
             activate_gemini_rate_limit(parse_retry_after_seconds(exc.headers.get("Retry-After")))
         elif exc.code in {401, 403}:
             activate_gemini_auth_cooldown()
-        log(f"Gemini vision call failed: {exc}")
+        log(f"Gemini vision call failed: {extract_http_error_details(exc)}")
         return None
     except Exception as exc:
         if is_ssl_verification_error(exc):
@@ -1299,7 +1432,7 @@ class MorseWorker:
     def stop(self) -> None:
         self.stop_event.set()
         self.queue.put(MorseTask(""))
-        self.thread.join(timeout=2.0)
+        self.thread.join()
 
     def submit(self, pattern: str) -> None:
         prepared_pattern = sanitize_morse_output(pattern)
@@ -1329,8 +1462,12 @@ class MorseWorker:
     def _play_pattern(self, pattern: str) -> None:
         letters = [letter.strip() for letter in pattern.split() if letter.strip()]
         for letter_index, letter in enumerate(letters):
+            if self.stop_event.is_set():
+                return
             symbols = [symbol for symbol in letter if symbol in ".-"]
             for symbol_index, symbol in enumerate(symbols):
+                if self.stop_event.is_set():
+                    return
                 self._pulse(MORSE_DOT_SECONDS if symbol == "." else MORSE_DASH_SECONDS)
                 if symbol_index < len(symbols) - 1:
                     self._pause(MORSE_ELEMENT_GAP)
@@ -1338,14 +1475,23 @@ class MorseWorker:
                 self._pause(MORSE_LETTER_GAP)
 
     def _pulse(self, duration: float) -> None:
+        if self.stop_event.is_set():
+            return
         GPIO.output(VIBRATION_PIN, GPIO.HIGH)
         GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.HIGH)
-        time.sleep(duration)
+        self._pause(duration)
         GPIO.output(VIBRATION_PIN, GPIO.LOW)
         GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.LOW)
 
     def _pause(self, duration: float) -> None:
-        time.sleep(duration)
+        if duration <= 0:
+            return
+        deadline = time.monotonic() + duration
+        while not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.02, remaining))
 
 
 def setup_gpio() -> None:
