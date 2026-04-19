@@ -29,11 +29,5 @@
     "endpoint": "${SOS_API_URL}",
     "token": "${SOS_API_TOKEN}",
     "timeout_seconds": 10
-  },
-  "gemma_local": {
-    "endpoint": "http://localhost:11434/api/chat",
-    "model": "gemma3",
-    "timeout_seconds": 3,
-    "retries": 1
   }
 }
