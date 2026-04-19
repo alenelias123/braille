@@ -10,9 +10,9 @@ Python prototype for a deafblind assistive device with:
 
 ## Repository Files
 
-- `/home/runner/work/braille/braille/code.py` — main runtime
-- `/home/runner/work/braille/braille/api_config.json` — API endpoint/key config
-- `/home/runner/work/braille/braille/.env` — environment overrides
+- `code.py` — main runtime
+- `api_config.json` — API endpoint/key config
+- `.env` — environment overrides
 
 ## Requirements
 
@@ -31,7 +31,7 @@ sudo apt install -y fswebcam
 
 ## Configuration
 
-Set values in `/home/runner/work/braille/braille/.env`:
+Set values in `.env`:
 
 - `GEMINI_API_KEY=...`
 - `CARETAKER_API_URL=...` (optional)
@@ -46,7 +46,7 @@ Optional Gemini compatibility flags:
 ## Run
 
 ```bash
-cd /home/runner/work/braille/braille
+cd /path/to/braille
 python3 code.py
 ```
 

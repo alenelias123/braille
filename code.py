@@ -510,9 +510,18 @@ MODE_PREFIXES = {
 }
 
 
+def sanitize_log_message(message: str) -> str:
+    sanitized = str(message)
+    sanitized = re.sub(r"([?&](?:key|api_key|token|access_token)=)[^&\s]+", r"\1***", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"(GEMINI_API_KEY=)[^\s]+", r"\1***", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "***", sanitized)
+    return sanitized
+
+
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
+    print(f"[{timestamp}] {sanitize_log_message(message)}", flush=True)
 
 
 def normalize_text(value: str) -> str:
@@ -1432,7 +1441,9 @@ class MorseWorker:
     def stop(self) -> None:
         self.stop_event.set()
         self.queue.put(MorseTask(""))
-        self.thread.join()
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            log("Morse worker did not stop within timeout; forcing GPIO cleanup path.")
 
     def submit(self, pattern: str) -> None:
         prepared_pattern = sanitize_morse_output(pattern)
@@ -1477,11 +1488,13 @@ class MorseWorker:
     def _pulse(self, duration: float) -> None:
         if self.stop_event.is_set():
             return
-        GPIO.output(VIBRATION_PIN, GPIO.HIGH)
-        GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.HIGH)
-        self._pause(duration)
-        GPIO.output(VIBRATION_PIN, GPIO.LOW)
-        GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.LOW)
+        try:
+            GPIO.output(VIBRATION_PIN, GPIO.HIGH)
+            GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.HIGH)
+            self._pause(duration)
+        finally:
+            GPIO.output(VIBRATION_PIN, GPIO.LOW)
+            GPIO.output(NAV_GUIDANCE_LED_PIN, GPIO.LOW)
 
     def _pause(self, duration: float) -> None:
         if duration <= 0:
