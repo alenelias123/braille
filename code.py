@@ -376,7 +376,7 @@ REQUEST_RETRY_BASE_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_BASE_DELAY_SEC
 REQUEST_RETRY_MAX_DELAY_SECONDS = float(os.getenv("REQUEST_RETRY_MAX_DELAY_SECONDS", "3.0"))
 ALLOW_INSECURE_SSL = os.getenv("GEMINI_ALLOW_INSECURE_SSL", "0").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_CA_BUNDLE = os.getenv("GEMINI_CA_BUNDLE", "").strip()
-GEMINI_USE_QUERY_API_KEY = os.getenv("GEMINI_USE_QUERY_API_KEY", "0").strip().lower() in {"1", "true", "yes", "on"}
+GEMINI_USE_QUERY_API_KEY = os.getenv("GEMINI_USE_QUERY_API_KEY", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 GEMINI_FLASH_CONFIG = API_CONFIG.get("gemini_flash", {}) if isinstance(API_CONFIG, dict) else {}
 GEMINI_VISION_CONFIG = API_CONFIG.get("gemini_vision", {}) if isinstance(API_CONFIG, dict) else {}

@@ -40,7 +40,7 @@ Set values in `.env`:
 - `SOS_API_TOKEN=...` (optional)
 
 Optional Gemini compatibility flags:
-- `GEMINI_USE_QUERY_API_KEY=0` (default; uses `x-goog-api-key` header)
+- `GEMINI_USE_QUERY_API_KEY=1` (default; passes key as `?key=` query parameter — matches api_test.py behaviour; set to `0` to use `x-goog-api-key` header instead)
 - `GEMINI_MODEL_FALLBACKS=gemini-2.0-flash,gemini-1.5-flash-latest,gemini-1.5-flash`
 
 ## Run
